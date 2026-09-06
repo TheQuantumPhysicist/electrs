@@ -14,6 +14,7 @@ mod connection;
 mod daemon;
 mod db;
 mod electrum;
+mod headerv2;
 mod index;
 mod mempool;
 mod merkle;

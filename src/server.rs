@@ -136,7 +136,7 @@ fn notify_peers(rpc: &Rpc, peers: HashMap<usize, Peer>) -> HashMap<usize, Peer> 
         .filter_map(|(_, mut peer)| match notify_peer(rpc, &mut peer) {
             Ok(()) => Some((peer.id, peer)),
             Err(e) => {
-                error!("failed to notify peer {}: {}", peer.id, e);
+                error!("failed to notify peer {}: {:#}", peer.id, e);
                 peer.disconnect();
                 None
             }

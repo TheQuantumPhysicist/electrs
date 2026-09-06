@@ -1,20 +1,21 @@
 use std::collections::HashMap;
 
-use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::{BlockHash, Network};
+
+use crate::headerv2::AnyHeader;
 
 /// A new header found, to be added to the chain at specific height
 pub(crate) struct NewHeader {
-    header: BlockHeader,
+    header: AnyHeader,
     hash: BlockHash,
     height: usize,
 }
 
 impl NewHeader {
-    pub(crate) fn from((header, height): (BlockHeader, usize)) -> Self {
+    pub(crate) fn from((header, height): (AnyHeader, usize)) -> Self {
         Self {
-            header,
             hash: header.block_hash(),
+            header,
             height,
         }
     }
@@ -30,7 +31,7 @@ impl NewHeader {
 
 /// Current blockchain headers' list
 pub struct Chain {
-    headers: Vec<(BlockHash, BlockHeader)>,
+    headers: Vec<(BlockHash, AnyHeader)>,
     heights: HashMap<BlockHash, usize>,
 }
 
@@ -40,7 +41,7 @@ impl Chain {
         let genesis = bitcoin::blockdata::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
         Self {
-            headers: vec![(genesis_hash, genesis.header)],
+            headers: vec![(genesis_hash, AnyHeader::V1(genesis.header))],
             heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
         }
     }
@@ -51,29 +52,29 @@ impl Chain {
         }
         let new_height = self.height().saturating_sub(n);
         self.update(vec![NewHeader::from((
-            self.headers[new_height].1,
+            self.headers[new_height].1.clone(),
             new_height,
         ))]);
     }
 
     /// Load the chain from a collection of headers, up to the given tip
-    pub(crate) fn load(&mut self, headers: impl Iterator<Item = BlockHeader>, tip: BlockHash) {
+    pub(crate) fn load(&mut self, headers: impl Iterator<Item = AnyHeader>, tip: BlockHash) {
         let genesis_hash = self.headers[0].0;
 
-        let header_map: HashMap<BlockHash, BlockHeader> =
+        let header_map: HashMap<BlockHash, AnyHeader> =
             headers.map(|h| (h.block_hash(), h)).collect();
         let mut blockhash = tip;
-        let mut new_headers: Vec<&BlockHeader> = Vec::with_capacity(header_map.len());
+        let mut new_headers: Vec<&AnyHeader> = Vec::with_capacity(header_map.len());
         while blockhash != genesis_hash {
             let header = match header_map.get(&blockhash) {
                 Some(header) => header,
                 None => panic!("missing header {} while loading from DB", blockhash),
             };
-            blockhash = header.prev_blockhash;
+            blockhash = header.prev_blockhash();
             new_headers.push(header);
         }
         info!("loading {} headers, tip={}", new_headers.len(), tip);
-        let new_headers = new_headers.into_iter().rev().copied(); // order by height
+        let new_headers = new_headers.into_iter().rev().cloned(); // order by height
         self.update(new_headers.zip(1..).map(NewHeader::from).collect())
     }
 
@@ -83,7 +84,7 @@ impl Chain {
     }
 
     /// Get the block header at specified height (if exists)
-    pub(crate) fn get_block_header(&self, height: usize) -> Option<&BlockHeader> {
+    pub(crate) fn get_block_header(&self, height: usize) -> Option<&AnyHeader> {
         self.headers.get(height).map(|(_hash, header)| header)
     }
 
@@ -110,6 +111,14 @@ impl Chain {
                 self.headers.len() - 1
             );
         }
+    }
+
+    /// Has this chain produced a v2 header?
+    pub(crate) fn has_v2_headers(&self) -> bool {
+        self.headers
+            .last()
+            .map(|(_hash, header)| header.is_v2())
+            .unwrap_or(false)
     }
 
     /// Best block hash
@@ -145,8 +154,7 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::{Chain, NewHeader};
-    use bitcoin::blockdata::block::Header as BlockHeader;
-    use bitcoin::consensus::deserialize;
+    use crate::headerv2::AnyHeader;
     use bitcoin::Network::Regtest;
     use hex_lit::hex;
 
@@ -176,9 +184,9 @@ hex!("000000205873f322b333933e656b07881bb399dae61a6c0fa74188b5fb0e3dd71c9e2442f9
 hex!("00000020fd1120713506267f1dba2e1856ca1d4490077d261cde8d3e182677880df0d856bf94cfa5e189c85462813751ab4059643759ed319a81e0617113758f8adf67bc2061cc60ffff7f2000000000"),
 hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a2061cc60ffff7f2002000000"),
         ];
-        let headers: Vec<BlockHeader> = byte_headers
+        let headers: Vec<AnyHeader> = byte_headers
             .iter()
-            .map(|byte_header| deserialize(byte_header).unwrap())
+            .map(|byte_header| AnyHeader::parse(byte_header).unwrap())
             .collect();
 
         for chunk_size in 1..headers.len() {
@@ -190,7 +198,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
                 for header in chunk {
                     height += 1;
                     tip = header.block_hash();
-                    update.push(NewHeader::from((*header, height)))
+                    update.push(NewHeader::from((header.clone(), height)))
                 }
                 regtest.update(update);
                 assert_eq!(regtest.tip(), tip);
@@ -203,7 +211,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         // test loading from a list of headers and tip
         let mut regtest = Chain::new(Regtest);
         regtest.load(
-            headers.iter().copied(),
+            headers.iter().cloned(),
             headers.last().unwrap().block_hash(),
         );
         assert_eq!(regtest.height(), headers.len());
@@ -243,12 +251,12 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         // test reorg
         let mut regtest = Chain::new(Regtest);
         regtest.load(
-            headers.iter().copied(),
+            headers.iter().cloned(),
             headers.last().unwrap().block_hash(),
         );
         let height = regtest.height();
 
-        let new_header: BlockHeader = deserialize(&hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a7a6bcc60ffff7f2000000000")).unwrap();
+        let new_header = AnyHeader::parse(&hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a7a6bcc60ffff7f2000000000")).unwrap();
         regtest.update(vec![NewHeader::from((new_header, height))]);
         assert_eq!(regtest.height(), height);
         assert_eq!(

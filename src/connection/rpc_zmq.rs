@@ -1,6 +1,4 @@
-use anyhow::{Context, Result};
-use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::consensus::deserialize;
+use anyhow::{bail, Context, Result};
 use bitcoin::BlockHash;
 use crossbeam_channel::{bounded, Receiver};
 
@@ -9,6 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::chain::{Chain, NewHeader};
+use crate::headerv2::AnyHeader;
 use crate::connection::BlockSource;
 use crate::metrics::{default_duration_buckets, Histogram, Metrics};
 use crate::types::SerBlock;
@@ -23,9 +22,6 @@ const FETCH_CONNECTIONS: usize = 4;
 
 /// Bounded channel depth between fetcher and consumer in `for_blocks`.
 const BLOCK_CHANNEL_DEPTH: usize = 10;
-
-/// Size of a serialized block header in bytes.
-const HEADER_SIZE: usize = 80;
 
 /// Block source backed entirely by the Bitcoin Core REST interface (for
 /// headers and blocks) and ZMQ (for new-block notifications).
@@ -101,24 +97,13 @@ impl RestZmqBlockSource {
             .context("invalid blockhash")
     }
 
-    /// `/rest/headers/<count>/<hash>.bin` → raw 80-byte headers.
+    /// `/rest/headers/<count>/<hash>.bin` -> raw v1/v2 headers.
     ///
     /// Returns up to `count` headers starting from **and including** `hash`.
-    fn raw_headers(&mut self, hash: &BlockHash, count: usize) -> Result<Vec<BlockHeader>> {
+    fn raw_headers(&mut self, hash: &BlockHash, count: usize) -> Result<Vec<AnyHeader>> {
         let path = format!("/rest/headers/{}/{}.bin", count, hash);
         let body = self.rest_conn.get(&path)?;
-
-        if body.len() % HEADER_SIZE != 0 {
-            bail!(
-                "REST headers: unexpected length {} (not a multiple of {})",
-                body.len(),
-                HEADER_SIZE
-            );
-        }
-
-        body.chunks_exact(HEADER_SIZE)
-            .map(|chunk| deserialize(chunk).context("invalid header from REST"))
-            .collect()
+        AnyHeader::parse_all(&body).context("invalid header stream from REST")
     }
 
     /// Fetch new headers after our tip in one REST call.
@@ -140,11 +125,11 @@ impl RestZmqBlockSource {
         }
 
         // Verify the first header connects to our tip.
-        if headers[0].prev_blockhash != chain.tip() {
+        if headers[0].prev_blockhash() != chain.tip() {
             bail!(
                 "REST header discontinuity: header at height {} has prev_blockhash {}, expected tip {}",
                 local_height + 1,
-                headers[0].prev_blockhash,
+                headers[0].prev_blockhash(),
                 chain.tip(),
             );
         }
@@ -152,11 +137,11 @@ impl RestZmqBlockSource {
         // Verify internal continuity.
         for i in 1..headers.len() {
             let expected = headers[i - 1].block_hash();
-            if headers[i].prev_blockhash != expected {
+            if headers[i].prev_blockhash() != expected {
                 bail!(
                     "REST header chain broken at index {}: prev_blockhash {} != expected {}",
                     i,
-                    headers[i].prev_blockhash,
+                    headers[i].prev_blockhash(),
                     expected,
                 );
             }
@@ -183,7 +168,7 @@ impl RestZmqBlockSource {
         chain: &Chain,
         remote_tip: BlockHash,
     ) -> Result<Vec<NewHeader>> {
-        let mut headers: Vec<BlockHeader> = Vec::new();
+        let mut headers: Vec<AnyHeader> = Vec::new();
         let mut current = remote_tip;
 
         loop {
@@ -200,7 +185,7 @@ impl RestZmqBlockSource {
                 .next()
                 .with_context(|| format!("REST: no header for {}", current))?;
 
-            let prev = header.prev_blockhash;
+            let prev = header.prev_blockhash();
             headers.push(header);
 
             if let Some(fork_height) = chain.get_block_height(&prev) {

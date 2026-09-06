@@ -1,9 +1,6 @@
 use anyhow::{bail, Context, Result};
 use bitcoin::{
-    consensus::{deserialize, encode::serialize_hex},
-    hashes::hex::FromHex,
-    hex::DisplayHex,
-    BlockHash, Transaction, Txid,
+    consensus::deserialize, hashes::hex::FromHex, hex::DisplayHex, BlockHash, Transaction, Txid,
 };
 use crossbeam_channel::Receiver;
 use rayon::prelude::*;
@@ -27,7 +24,6 @@ use crate::{
     types::ScriptHash,
 };
 
-const PROTOCOL_VERSION: &str = "1.4";
 const UNKNOWN_FEE: isize = -1; // (allowed by Electrum protocol)
 
 const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method of querying electrs, consider contacting the developer of your wallet. Reason:";
@@ -37,6 +33,7 @@ const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method
 pub struct Client {
     tip: Option<BlockHash>,
     scripthashes: HashMap<ScriptHash, ScriptHashStatus>,
+    negotiated: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -214,12 +211,13 @@ impl Rpc {
         if let Some(old_tip) = client.tip {
             let new_tip = self.tracker.chain().tip();
             if old_tip != new_tip {
+                self.check_may_serve_headers(client)?;
                 client.tip = Some(new_tip);
                 let height = chain.height();
                 let header = chain.get_block_header(height).unwrap();
                 notifications.push(notification(
                     "blockchain.headers.subscribe",
-                    &[json!({"hex": serialize_hex(&header), "height": height})],
+                    &[json!({"hex": header.serialize_hex(), "height": height})],
                 ));
             }
         }
@@ -227,23 +225,30 @@ impl Rpc {
     }
 
     fn headers_subscribe(&self, client: &mut Client) -> Result<Value> {
+        self.check_may_serve_headers(client)?;
         let chain = self.tracker.chain();
         client.tip = Some(chain.tip());
         let height = chain.height();
         let header = chain.get_block_header(height).unwrap();
-        Ok(json!({"hex": serialize_hex(header), "height": height}))
+        Ok(json!({"hex": header.serialize_hex(), "height": height}))
     }
 
-    fn block_header(&self, (height,): (usize,)) -> Result<Value> {
+    fn block_header(&self, client: &Client, (height,): (usize,)) -> Result<Value> {
+        self.check_may_serve_headers(client)?;
         let chain = self.tracker.chain();
         let header = match chain.get_block_header(height) {
             None => bail!("no header at {}", height),
             Some(header) => header,
         };
-        Ok(json!(serialize_hex(header)))
+        Ok(json!(header.serialize_hex()))
     }
 
-    fn block_headers(&self, (start_height, count): (usize, usize)) -> Result<Value> {
+    fn block_headers(
+        &self,
+        client: &Client,
+        (start_height, count): (usize, usize),
+    ) -> Result<Value> {
+        self.check_may_serve_headers(client)?;
         let chain = self.tracker.chain();
         let max_count = 2016usize;
         // return only the available block headers
@@ -254,7 +259,7 @@ impl Rpc {
         let heights = start_height..end_height;
         let count = heights.len();
         let hex_headers =
-            heights.filter_map(|height| chain.get_block_header(height).map(serialize_hex));
+            heights.filter_map(|height| chain.get_block_header(height).map(|h| h.serialize_hex()));
 
         Ok(json!({"count": count, "hex": String::from_iter(hex_headers), "max": max_count}))
     }
@@ -495,25 +500,63 @@ impl Rpc {
         format!("electrs/{}", ELECTRS_VERSION)
     }
 
-    fn version(&self, (client_id, client_version): &(String, VersionRequest)) -> Result<Value> {
-        match client_version {
-            VersionRequest::Single(exact) => check_between(PROTOCOL_VERSION, exact, exact),
-            VersionRequest::MinMax(min, max) => check_between(PROTOCOL_VERSION, min, max),
+    fn protocol_version(&self) -> &'static str {
+        crate::headerv2::protocol_version(self.tracker.chain().has_v2_headers())
+    }
+
+    fn check_may_serve_headers(&self, client: &Client) -> Result<()> {
+        let chain_has_v2 = self.tracker.chain().has_v2_headers();
+        if crate::headerv2::may_serve_headers(chain_has_v2, client.negotiated) {
+            Ok(())
+        } else {
+            bail!(
+                "refusing block headers to a client at protocol {}: {}",
+                client.negotiated.unwrap_or("(unnegotiated)"),
+                crate::headerv2::HEADER_REFUSAL
+            )
         }
-        .with_context(|| format!("unsupported request {:?} by {}", client_version, client_id))?;
-        Ok(json!([self.server_id(), PROTOCOL_VERSION]))
+    }
+
+    fn version(
+        &self,
+        client: &mut Client,
+        (client_id, client_version): &(String, VersionRequest),
+    ) -> Result<Value> {
+        let version = self.protocol_version();
+        match client_version {
+            VersionRequest::Single(exact) => check_between(version, exact, exact),
+            VersionRequest::MinMax(min, max) => check_between(version, min, max),
+        }
+        .with_context(|| {
+            if version == crate::headerv2::PROTOCOL_VERSION_V2 {
+                format!(
+                    "unsupported request {:?} by {}: this chain uses 164-byte block headers with a BLAKE2b block hash, which a client below protocol {} cannot read",
+                    client_version, client_id, version
+                )
+            } else {
+                format!("unsupported request {:?} by {}", client_version, client_id)
+            }
+        })?;
+        client.negotiated = Some(version);
+        Ok(json!([self.server_id(), version]))
     }
 
     fn features(&self) -> Result<Value> {
-        Ok(json!({
-            "genesis_hash": self.tracker.chain().get_block_hash(0),
+        let chain = self.tracker.chain();
+        let version = self.protocol_version();
+        let mut features = json!({
+            "genesis_hash": chain.get_block_hash(0),
             "hosts": { "tcp_port": self.port },
-            "protocol_max": PROTOCOL_VERSION,
-            "protocol_min": PROTOCOL_VERSION,
+            "protocol_max": version,
+            "protocol_min": version,
             "pruning": null,
             "server_version": self.server_id(),
             "hash_function": "sha256"
-        }))
+        });
+        if let Some(fork) = crate::headerv2::fork_point(chain) {
+            features["blake2b_fork"] = fork;
+        }
+        Ok(features)
     }
 
     pub fn handle_requests(&self, client: &mut Client, lines: &[String]) -> Vec<String> {
@@ -597,8 +640,8 @@ impl Rpc {
             }
             let result = match &call.params {
                 Params::Banner => Ok(json!(self.banner)),
-                Params::BlockHeader(args) => self.block_header(*args),
-                Params::BlockHeaders(args) => self.block_headers(*args),
+                Params::BlockHeader(args) => self.block_header(client, *args),
+                Params::BlockHeaders(args) => self.block_headers(client, *args),
                 Params::Donation => Ok(Value::Null),
                 Params::EstimateFee(args) => self.estimate_fee(*args),
                 Params::Features => self.features(),
@@ -619,7 +662,7 @@ impl Rpc {
                 Params::TransactionGet(args) => self.transaction_get(args),
                 Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
                 Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
-                Params::Version(args) => self.version(args),
+                Params::Version(args) => self.version(client, args),
             };
             call.response(result)
         })

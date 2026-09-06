@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::consensus::Encodable;
 use bitcoin::{
     consensus::{
@@ -15,9 +14,8 @@ use bitcoin::{
         message_network, Magic,
     },
     secp256k1::{self, rand::Rng},
-    Block, BlockHash,
+    BlockHash,
 };
-use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 
 use std::io::Write;
@@ -29,6 +27,7 @@ use crate::types::SerBlock;
 use crate::{
     chain::{Chain, NewHeader},
     config::ELECTRS_VERSION,
+    headerv2::AnyHeader,
     metrics::{default_duration_buckets, default_size_buckets, Histogram, Metrics},
 };
 
@@ -58,7 +57,7 @@ impl Request {
 pub struct Connection {
     req_send: Sender<Request>,
     blocks_recv: Receiver<SerBlock>,
-    headers_recv: Receiver<Vec<BlockHeader>>,
+    headers_recv: Receiver<Vec<AnyHeader>>,
     new_block_recv: Receiver<()>,
 
     blocks_duration: Histogram,
@@ -78,7 +77,7 @@ impl Connection {
         debug!("got {} new headers", headers.len());
         let prev_blockhash = match headers.first() {
             None => return Ok(vec![]),
-            Some(first) => first.prev_blockhash,
+            Some(first) => first.prev_blockhash(),
         };
         let new_heights = match chain.get_block_height(&prev_blockhash) {
             Some(last_height) => (last_height + 1)..,
@@ -115,13 +114,9 @@ impl Connection {
                         .blocks_recv
                         .recv()
                         .with_context(|| format!("failed to get block {}", hash))?;
-                    let header = bsl::BlockHeader::parse(&block[..])
-                        .expect("core returned invalid blockheader")
-                        .parsed_owned();
-                    ensure!(
-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
-                        "got unexpected block"
-                    );
+                    let header = AnyHeader::parse(&block)
+                        .context("peer returned an unparseable block header")?;
+                    ensure!(header.block_hash() == hash, "got unexpected block");
                     Ok(block)
                 })?;
                 self.blocks_duration
@@ -240,7 +235,7 @@ impl Connection {
 
         let (req_send, req_recv) = bounded::<Request>(1);
         let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
-        let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
+        let (headers_send, headers_recv) = bounded::<Vec<AnyHeader>>(1);
         let (new_block_send, new_block_recv) = bounded::<()>(0);
         let (init_send, init_recv) = bounded::<()>(0);
 
@@ -356,7 +351,16 @@ impl RawNetworkMessage {
                 let len = VarInt::consensus_decode(&mut raw)?.0;
                 let mut headers = Vec::with_capacity(len as usize);
                 for _ in 0..len {
-                    headers.push(Block::consensus_decode(&mut raw)?.header);
+                    let header =
+                        AnyHeader::parse(raw).context("invalid block header in headers message")?;
+                    raw = &raw[header.size()..];
+                    let txcount = VarInt::consensus_decode(&mut raw)?.0;
+                    ensure!(
+                        txcount == 0,
+                        "headers message carried a block with {} transactions",
+                        txcount
+                    );
+                    headers.push(header);
                 }
                 ParsedNetworkMessage::Headers(headers)
             }
@@ -380,7 +384,7 @@ enum ParsedNetworkMessage {
     Verack,
     Inv(Vec<Inventory>),
     Ping(u64),
-    Headers(Vec<BlockHeader>),
+    Headers(Vec<AnyHeader>),
     Block(SerBlock),
     Ignored,
 }

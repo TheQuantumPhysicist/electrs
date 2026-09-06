@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use bitcoin::consensus::{deserialize, Decodable, Encodable};
+use bitcoin::consensus::{deserialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
-use bitcoin_slices::{bsl, Visit, Visitor};
+use bitcoin_slices::{bsl, Visitor};
 use std::ops::ControlFlow;
 use std::thread;
+
+use crate::headerv2::{visit_block_txs, AnyHeader};
 
 use crate::{
     chain::{Chain, NewHeader},
@@ -54,11 +56,16 @@ impl Stats {
         self.update_size.observe(label, (rows.len() * N) as f64);
     }
 
+    fn observe_size_var(&self, label: &str, rows: &[Vec<u8>]) {
+        let bytes: usize = rows.iter().map(Vec::len).sum();
+        self.update_size.observe(label, bytes as f64);
+    }
+
     fn observe_batch(&self, batch: &WriteBatch) {
         self.observe_size("write_funding_rows", &batch.funding_rows);
         self.observe_size("write_spending_rows", &batch.spending_rows);
         self.observe_size("write_txid_rows", &batch.txid_rows);
-        self.observe_size("write_header_rows", &batch.header_rows);
+        self.observe_size_var("write_header_rows", &batch.header_rows);
         debug!(
             "writing {} funding and {} spending rows from {} transactions, {} blocks",
             batch.funding_rows.len(),
@@ -104,7 +111,7 @@ impl Index {
             let tip = deserialize(&row).expect("invalid tip");
             let headers = store
                 .iter_headers()
-                .map(|row| HeaderRow::from_db_row(row).header);
+                .map(|row| HeaderRow::from_db_row(&row).header);
             chain.load(headers, tip);
             chain.drop_last_headers(reindex_last_blocks);
         };
@@ -303,18 +310,15 @@ fn index_single_block(
             ControlFlow::Continue(())
         }
 
-        fn visit_block_header(&mut self, header: &bsl::BlockHeader) -> ControlFlow<()> {
-            let header = bitcoin::block::Header::consensus_decode(&mut header.as_ref())
-                .expect("block header was already validated");
-            self.batch
-                .header_rows
-                .push(HeaderRow::new(header).to_db_row());
-            ControlFlow::Continue(())
-        }
     }
 
+    let header = AnyHeader::parse(&block).expect("core returned an unparseable block header");
+    batch
+        .header_rows
+        .push(HeaderRow::new(header.clone()).to_db_row());
+
     let mut index_block = IndexBlockVisitor { batch, height };
-    bsl::Block::visit(&block, &mut index_block).expect("core returned invalid block");
+    visit_block_txs(&block, &header, &mut index_block).expect("core returned invalid block");
 
     let len = block_hash
         .consensus_encode(&mut (&mut batch.tip_row as &mut [u8]))

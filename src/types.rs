@@ -2,13 +2,14 @@ use anyhow::Result;
 
 use std::convert::TryFrom;
 
-use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::{
     consensus::encode::{deserialize, Decodable, Encodable},
     hashes::{hash_newtype, sha256, Hash},
     io, OutPoint, Script, Txid,
 };
 use bitcoin_slices::bsl;
+
+use crate::headerv2::AnyHeader;
 
 macro_rules! impl_consensus_encoding {
     ($thing:ident, $($field:ident),+) => (
@@ -163,33 +164,26 @@ impl TxidRow {
 
 // ***************************************************************************
 
-pub(crate) type SerializedHeaderRow = [u8; HEADER_ROW_SIZE];
+pub(crate) type SerializedHeaderRow = Vec<u8>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub(crate) struct HeaderRow {
-    pub(crate) header: BlockHeader,
+    pub(crate) header: AnyHeader,
 }
 
-pub const HEADER_ROW_SIZE: usize = 80;
-
-impl_consensus_encoding!(HeaderRow, header);
-
 impl HeaderRow {
-    pub(crate) fn new(header: BlockHeader) -> Self {
+    pub(crate) fn new(header: AnyHeader) -> Self {
         Self { header }
     }
 
     pub(crate) fn to_db_row(&self) -> SerializedHeaderRow {
-        let mut row = [0; HEADER_ROW_SIZE];
-        let len = self
-            .consensus_encode(&mut (&mut row as &mut [u8]))
-            .expect("in-memory writers don't error");
-        debug_assert_eq!(len, HEADER_ROW_SIZE);
-        row
+        self.header.serialize()
     }
 
-    pub(crate) fn from_db_row(row: SerializedHeaderRow) -> Self {
-        deserialize(&row).expect("bad HeaderRow")
+    pub(crate) fn from_db_row(row: &[u8]) -> Self {
+        Self {
+            header: AnyHeader::parse_exact(row).expect("bad HeaderRow"),
+        }
     }
 }
 

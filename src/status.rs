@@ -4,9 +4,11 @@ use bitcoin::{
     hashes::{sha256, Hash, HashEngine},
     Amount, BlockHash, OutPoint, SignedAmount, Transaction, Txid,
 };
-use bitcoin_slices::{bsl, Visit, Visitor};
+use bitcoin_slices::{bsl, Visitor};
 use rayon::prelude::*;
 use serde::ser::{Serialize, Serializer};
+
+use crate::headerv2::{visit_block_txs, AnyHeader};
 
 use std::convert::TryFrom;
 use std::{
@@ -559,7 +561,8 @@ fn filter_block_txs_outputs(block: SerBlock, scripthash: ScriptHash) -> Vec<Filt
         pos: 0,
     };
 
-    bsl::Block::visit(&block, &mut find_outputs).expect("core returned invalid block");
+    let header = AnyHeader::parse(&block).expect("core returned an unparseable block header");
+    visit_block_txs(&block, &header, &mut find_outputs).expect("core returned invalid block");
 
     find_outputs.result
 }
@@ -606,7 +609,8 @@ fn filter_block_txs_inputs(
         pos: 0,
     };
 
-    bsl::Block::visit(block, &mut find_inputs).expect("core returned invalid block");
+    let header = AnyHeader::parse(block).expect("core returned an unparseable block header");
+    visit_block_txs(block, &header, &mut find_inputs).expect("core returned invalid block");
 
     find_inputs.result
 }

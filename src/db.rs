@@ -4,6 +4,7 @@ use rust_rocksdb as rocksdb;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::headerv2::{HEADER_V1_SIZE, HEADER_V2_SIZE};
 use crate::types::{HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow};
 
 #[derive(Default)]
@@ -270,10 +271,13 @@ impl DBStore {
         self.iter_cf(cf, opts, Some(prefix))
     }
 
+    /// Iterate stored block headers of either legal header size.
     pub(crate) fn iter_headers(&self) -> impl Iterator<Item = SerializedHeaderRow> + '_ {
         let mut opts = rocksdb::ReadOptions::default();
         opts.fill_cache(false);
-        self.iter_cf(self.headers_cf(), opts, None)
+        let mut raw = self.db.raw_iterator_cf_opt(self.headers_cf(), opts);
+        raw.seek_to_first();
+        HeaderIterator { raw, done: false }
     }
 
     pub(crate) fn get_tip(&self) -> Option<Vec<u8>> {
@@ -425,6 +429,37 @@ impl<const N: usize> Iterator for DBIterator<'_, N> {
             match result {
                 Some(value) => return Some(value),
                 None => continue, // skip keys with size != N
+            }
+        }
+        self.done = true;
+        None
+    }
+}
+
+struct HeaderIterator<'a> {
+    raw: rocksdb::DBRawIterator<'a>,
+    done: bool,
+}
+
+impl Iterator for HeaderIterator<'_> {
+    type Item = SerializedHeaderRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            let key = match self.raw.key() {
+                Some(key) => key,
+                None => {
+                    self.raw.status().expect("DB scan failed");
+                    break;
+                }
+            };
+            let row = match key.len() {
+                HEADER_V1_SIZE | HEADER_V2_SIZE => Some(key.to_vec()),
+                _ => None,
+            };
+            self.raw.next();
+            if let Some(row) = row {
+                return Some(row);
             }
         }
         self.done = true;

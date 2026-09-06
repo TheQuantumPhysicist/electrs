@@ -2,7 +2,9 @@ use std::ops::ControlFlow;
 
 use anyhow::{Context, Result};
 use bitcoin::{BlockHash, Txid};
-use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
+use bitcoin_slices::{bsl, Visitor};
+
+use crate::headerv2::{visit_block_txs, AnyHeader};
 
 use crate::{
     cache::Cache,
@@ -115,10 +117,11 @@ impl Tracker {
                 return; // keep first matching transaction
             }
             let mut visitor = FindTransaction::new(txid);
-            result = match bsl::Block::visit(&block, &mut visitor) {
-                Ok(_) | Err(VisitBreak) => visitor.found.map(|tx| (blockhash, tx)),
-                Err(e) => panic!("core returned invalid block: {:?}", e),
-            };
+            let header =
+                AnyHeader::parse(&block).expect("core returned an unparseable block header");
+            visit_block_txs(&block, &header, &mut visitor)
+                .unwrap_or_else(|e| panic!("core returned invalid block: {:#}", e));
+            result = visitor.found.map(|tx| (blockhash, tx));
         })?;
         Ok(result)
     }
