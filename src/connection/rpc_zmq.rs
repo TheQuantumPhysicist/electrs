@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use bitcoin::BlockHash;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver, TrySendError};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -70,7 +70,6 @@ impl RestZmqBlockSource {
 
     /// `/rest/chaininfo.json` → (best block hash, height).
     fn chain_info(&mut self) -> Result<(BlockHash, usize)> {
-        let started = Instant::now();
         let body = self.rest_conn.get("/rest/chaininfo.json")?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).context("invalid chaininfo JSON")?;
@@ -81,60 +80,30 @@ impl RestZmqBlockSource {
             .parse()
             .context("invalid bestblockhash")?;
         let height = v["blocks"].as_u64().context("missing blocks")? as usize;
-        let header_height = v["headers"].as_u64();
-        info!(
-            "[blake2b-diag] REST chaininfo blocks={} headers={:?} remote_tip={} elapsed_ms={}",
-            height,
-            header_height,
-            tip,
-            started.elapsed().as_millis(),
-        );
         Ok((tip, height))
     }
 
     /// `/rest/blockhashbyheight/<h>.json` → block hash at height.
     fn block_hash_at_height(&mut self, height: usize) -> Result<BlockHash> {
-        let started = Instant::now();
         let path = format!("/rest/blockhashbyheight/{}.json", height);
         let body = self.rest_conn.get(&path)?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).context("invalid blockhashbyheight JSON")?;
 
-        let hash = v["blockhash"]
+        v["blockhash"]
             .as_str()
             .context("missing blockhash")?
             .parse()
-            .context("invalid blockhash")?;
-        info!(
-            "[blake2b-diag] blockhashbyheight height={} hash={} elapsed_ms={}",
-            height,
-            hash,
-            started.elapsed().as_millis(),
-        );
-        Ok(hash)
+            .context("invalid blockhash")
     }
 
     /// `/rest/headers/<count>/<hash>.bin` -> raw v1/v2 headers.
     ///
     /// Returns up to `count` headers starting from **and including** `hash`.
     fn raw_headers(&mut self, hash: &BlockHash, count: usize) -> Result<Vec<AnyHeader>> {
-        let started = Instant::now();
         let path = format!("/rest/headers/{}/{}.bin", count, hash);
         let body = self.rest_conn.get(&path)?;
-        let headers = AnyHeader::parse_all(&body).context("invalid header stream from REST")?;
-        let v1 = headers.iter().filter(|h| !h.is_v2()).count();
-        let v2 = headers.len() - v1;
-        info!(
-            "[blake2b-diag] headers start_hash={} requested={} bytes={} parsed={} v1={} v2={} elapsed_ms={}",
-            hash,
-            count,
-            body.len(),
-            headers.len(),
-            v1,
-            v2,
-            started.elapsed().as_millis(),
-        );
-        Ok(headers)
+        AnyHeader::parse_all(&body).context("invalid header stream from REST")
     }
 
     /// Fetch new headers after our tip in one REST call.
@@ -160,6 +129,18 @@ impl RestZmqBlockSource {
             return Ok(vec![]);
         }
 
+        let v1 = headers.iter().filter(|header| !header.is_v2()).count();
+        let v2 = headers.len() - v1;
+        info!(
+            "[blake2b-diag] parsed new header batch start_height={} count={} v1={} v2={} first_hash={} last_hash={}",
+            local_height + 1,
+            headers.len(),
+            v1,
+            v2,
+            headers[0].block_hash(),
+            headers.last().expect("non-empty header batch").block_hash(),
+        );
+
         let first_hash = headers[0].block_hash();
         if first_hash != next_hash {
             error!(
@@ -170,13 +151,6 @@ impl RestZmqBlockSource {
                 header_details(&headers[0]),
             );
             log_hash_stages(&headers[0]);
-        } else {
-            info!(
-                "[blake2b-diag] first header hash verified height={} hash={} {}",
-                local_height + 1,
-                first_hash,
-                header_details(&headers[0]),
-            );
         }
 
         // Verify the first header connects to our tip.
@@ -276,15 +250,6 @@ impl BlockSource for RestZmqBlockSource {
     /// Fast path: verify our tip is on the main chain, fetch headers in one
     /// REST call. Slow path (reorg): walk backwards to find fork point.
     fn get_new_headers(&mut self, chain: &Chain) -> Result<Vec<NewHeader>> {
-        info!(
-            "[blake2b-diag] sync probe local_height={} local_tip={} local_tip_kind={}",
-            chain.height(),
-            chain.tip(),
-            chain
-                .get_block_header(chain.height())
-                .map(header_kind)
-                .unwrap_or("missing"),
-        );
         let (remote_tip, remote_height) = self.chain_info()?;
 
         // Already at tip.
@@ -297,11 +262,6 @@ impl BlockSource for RestZmqBlockSource {
                     remote_tip,
                 );
             }
-            info!(
-                "[blake2b-diag] sync result=already-known remote_tip_height={} remote_height={}",
-                height,
-                remote_height,
-            );
             return Ok(vec![]);
         }
 
@@ -311,11 +271,6 @@ impl BlockSource for RestZmqBlockSource {
         if local_height <= remote_height {
             let hash_at_ours = self.block_hash_at_height(local_height)?;
             if hash_at_ours == chain.tip() {
-                info!(
-                    "[blake2b-diag] active-chain check=match height={} hash={}",
-                    local_height,
-                    hash_at_ours,
-                );
                 let headers = self.fetch_headers_after_tip(chain)?;
                 if local_height + headers.len() == remote_height {
                     if let Some(last) = headers.last() {
@@ -325,12 +280,6 @@ impl BlockSource for RestZmqBlockSource {
                                 remote_height,
                                 remote_tip,
                                 last.hash(),
-                            );
-                        } else {
-                            info!(
-                                "[blake2b-diag] remote tip hash verified height={} hash={}",
-                                remote_height,
-                                remote_tip,
                             );
                         }
                     }
@@ -487,7 +436,7 @@ impl RestConn {
         match self.do_get(path) {
             Ok(body) => {
                 let elapsed = started.elapsed();
-                if elapsed >= Duration::from_secs(2) {
+                if elapsed >= Duration::from_secs(10) {
                     warn!(
                         "[blake2b-diag] slow REST GET path={} bytes={} elapsed_ms={}",
                         path,
@@ -508,7 +457,7 @@ impl RestConn {
                 let retry_started = Instant::now();
                 let result = self.do_get(path);
                 match &result {
-                    Ok(body) => info!(
+                    Ok(body) => warn!(
                         "[blake2b-diag] REST GET retry succeeded path={} bytes={} elapsed_ms={}",
                         path,
                         body.len(),
@@ -659,30 +608,34 @@ fn spawn_zmq_listener(endpoint: &str) -> Result<Receiver<()>> {
                 }
             }
         }
-        let notify = tx.try_send(());
-        let queued = notify.is_ok();
-        let frame_sizes: Vec<usize> = frames.iter().map(Vec::len).collect();
         let payload_hex = frames
             .first()
             .map(|frame| bytes_hex(frame))
             .unwrap_or_default();
-        info!(
-            "[blake2b-diag] ZMQ event topic={} frame_sizes={:?} payload_hex={} notification_queued={}",
-            String::from_utf8_lossy(&topic),
-            frame_sizes,
-            payload_hex,
-            queued,
-        );
+        match tx.try_send(()) {
+            Ok(()) => info!(
+                "[blake2b-diag] ZMQ block wakeup queued topic={} hash_raw={}",
+                String::from_utf8_lossy(&topic),
+                payload_hex,
+            ),
+            Err(TrySendError::Full(())) => warn!(
+                "[blake2b-diag] ZMQ block wakeup DROPPED reason=receiver-not-ready topic={} hash_raw={}",
+                String::from_utf8_lossy(&topic),
+                payload_hex,
+            ),
+            Err(TrySendError::Disconnected(())) => {
+                error!(
+                    "[blake2b-diag] ZMQ block wakeup lost reason=receiver-disconnected endpoint={} topic={} hash_raw={}",
+                    ep,
+                    String::from_utf8_lossy(&topic),
+                    payload_hex,
+                );
+                return Ok(());
+            }
+        }
     });
 
     Ok(rx)
-}
-
-fn header_kind(header: &AnyHeader) -> &'static str {
-    match header {
-        AnyHeader::V1(_) => "v1",
-        AnyHeader::V2(_) => "v2",
-    }
 }
 
 fn header_details(header: &AnyHeader) -> String {

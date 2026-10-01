@@ -300,32 +300,16 @@ impl Daemon {
     }
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
-        info!(
-            "[blake2b-diag] daemon get_new_headers begin local_height={} local_tip={}",
-            chain.height(),
-            chain.tip(),
-        );
-        match self.rpc.get_blockchain_info() {
-            Ok(info) => info!(
-                "[blake2b-diag] RPC chaininfo blocks={} headers={} best_block_hash={}",
-                info.blocks,
-                info.headers,
-                info.best_block_hash,
-            ),
-            Err(err) => warn!(
-                "[blake2b-diag] RPC getblockchaininfo failed but continuing with block source: {:#}",
-                err,
-            ),
-        }
-
         let started = std::time::Instant::now();
         let result = self.block_source.lock().get_new_headers(chain);
         match &result {
-            Ok(headers) => info!(
-                "[blake2b-diag] daemon get_new_headers end count={} elapsed_ms={}",
+            Ok(headers) if !headers.is_empty() => info!(
+                "[blake2b-diag] header sync discovered count={} from_local_height={} elapsed_ms={}",
                 headers.len(),
+                chain.height(),
                 started.elapsed().as_millis(),
             ),
+            Ok(_) => {},
             Err(err) => error!(
                 "[blake2b-diag] daemon get_new_headers failed elapsed_ms={} error={:#}",
                 started.elapsed().as_millis(),

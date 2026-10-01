@@ -7,6 +7,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     iter::once,
     net::{Shutdown, TcpListener, TcpStream},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -87,11 +88,55 @@ fn serve() -> Result<()> {
 
     let new_block_rx = rpc.new_block_notification();
     let mut peers = HashMap::<usize, Peer>::new();
+    let mut last_sync = Instant::now();
+    let mut sync_starved = false;
     loop {
+        if !server_rx.is_empty()
+            && last_sync.elapsed() >= Duration::from_secs(30)
+            && !sync_starved
+        {
+            warn!(
+                "[blake2b-diag] sync starvation entered since_last_sync_ms={} queued_server_events={} peers={}",
+                last_sync.elapsed().as_millis(),
+                server_rx.len(),
+                peers.len(),
+            );
+            sync_starved = true;
+        }
+
         // initial sync and compaction may take a few hours
         while server_rx.is_empty() {
+            if sync_starved {
+                info!(
+                    "[blake2b-diag] sync starvation recovered after_ms={} peers={}",
+                    last_sync.elapsed().as_millis(),
+                    peers.len(),
+                );
+                sync_starved = false;
+            }
+            let sync_started = Instant::now();
             let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?; // sync a batch of blocks
+            let sync_elapsed = sync_started.elapsed();
+            last_sync = Instant::now();
+            if sync_elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow sync elapsed_ms={} queued_server_events={} peers={}",
+                    sync_elapsed.as_millis(),
+                    server_rx.len(),
+                    peers.len(),
+                );
+            }
+            let notify_started = Instant::now();
             peers = duration.observe_duration("notify", || notify_peers(&rpc, peers)); // peers are disconnected on error
+            let notify_elapsed = notify_started.elapsed();
+            if notify_elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow peer notification pass elapsed_ms={} peers={} queued_server_events={}",
+                    notify_elapsed.as_millis(),
+                    peers.len(),
+                    server_rx.len(),
+                );
+            }
             if !done {
                 continue; // more blocks to sync
             }
@@ -109,7 +154,23 @@ fn serve() -> Result<()> {
                 },
                 // Handle new blocks' notifications
                 recv(new_block_rx) -> result => match result {
-                    Ok(_) => (), // sync and update
+                    Ok(_) => {
+                        let pending = server_rx.len();
+                        if pending == 0 {
+                            info!(
+                                "[blake2b-diag] block wakeup consumed since_last_sync_ms={} peers={}",
+                                last_sync.elapsed().as_millis(),
+                                peers.len(),
+                            );
+                        } else {
+                            warn!(
+                                "[blake2b-diag] block wakeup consumed but sync deferred queued_server_events={} since_last_sync_ms={} peers={}",
+                                pending,
+                                last_sync.elapsed().as_millis(),
+                                peers.len(),
+                            );
+                        }
+                    }, // sync and update
                     Err(_) => {
                         info!("disconnected from bitcoind");
                         return Ok(());
@@ -121,7 +182,19 @@ fn serve() -> Result<()> {
                     let rest = server_rx.iter().take(server_rx.len());
                     let events: Vec<Event> = first.chain(rest).collect();
                     server_batch_size.observe("recv", events.len() as f64);
+                    let event_count = events.len();
+                    let handle_started = Instant::now();
                     duration.observe_duration("handle", || handle_events(&rpc, &mut peers, events));
+                    let handle_elapsed = handle_started.elapsed();
+                    if handle_elapsed >= Duration::from_secs(10) {
+                        warn!(
+                            "[blake2b-diag] slow Electrum event batch events={} elapsed_ms={} queued_after={} peers={}",
+                            event_count,
+                            handle_elapsed.as_millis(),
+                            server_rx.len(),
+                            peers.len(),
+                        );
+                    }
                 },
                 default(config.wait_duration) => (), // sync and update
             };
@@ -196,7 +269,18 @@ fn handle_peer_events(
     }
     let result = match peers.get_mut(&peer_id) {
         Some(peer) => {
+            let request_started = Instant::now();
             let responses = rpc.handle_requests(&mut peer.client, &lines);
+            let request_elapsed = request_started.elapsed();
+            if request_elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow peer request peer={} lines={} elapsed_ms={} methods={}",
+                    peer_id,
+                    lines.len(),
+                    request_elapsed.as_millis(),
+                    request_method_summary(&lines),
+                );
+            }
             peer.send(responses)
         }
         None => return, // unknown peer
@@ -206,6 +290,38 @@ fn handle_peer_events(
         peers.remove(&peer_id).unwrap().disconnect();
     } else if done {
         peers.remove(&peer_id); // already disconnected, just remove from peers' map
+    }
+}
+
+fn request_method_summary(lines: &[String]) -> String {
+    fn collect(value: &serde_json::Value, methods: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, methods);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if let Some(method) = object.get("method").and_then(|value| value.as_str()) {
+                    if !methods.iter().any(|seen| seen == method) && methods.len() < 8 {
+                        methods.push(method.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut methods = Vec::new();
+    for line in lines {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            collect(&value, &mut methods);
+        }
+    }
+    if methods.is_empty() {
+        "unknown".to_owned()
+    } else {
+        methods.join(",")
     }
 }
 
