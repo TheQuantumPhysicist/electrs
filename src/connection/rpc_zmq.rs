@@ -2,8 +2,11 @@ use anyhow::{bail, Context, Result};
 use bitcoin::BlockHash;
 use crossbeam_channel::{bounded, Receiver, TrySendError};
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::chain::{Chain, NewHeader};
@@ -22,6 +25,80 @@ const FETCH_CONNECTIONS: usize = 4;
 
 /// Bounded channel depth between fetcher and consumer in `for_blocks`.
 const BLOCK_CHANNEL_DEPTH: usize = 10;
+
+struct RestRequestDiag {
+    path: String,
+    since: Instant,
+    stage: &'static str,
+}
+
+struct RestRequestGuard(u64);
+
+static REST_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static REST_DIAG_ACTIVE: OnceLock<Mutex<HashMap<u64, RestRequestDiag>>> = OnceLock::new();
+
+fn rest_diag() -> &'static Mutex<HashMap<u64, RestRequestDiag>> {
+    REST_DIAG_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl RestRequestGuard {
+    fn new(path: &str) -> Self {
+        let id = REST_DIAG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        rest_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                id,
+                RestRequestDiag {
+                    path: path.to_owned(),
+                    since: Instant::now(),
+                    stage: "first-attempt",
+                },
+            );
+        Self(id)
+    }
+
+    fn set_stage(&self, stage: &'static str) {
+        if let Some(request) = rest_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get_mut(&self.0)
+        {
+            request.stage = stage;
+        }
+    }
+}
+
+impl Drop for RestRequestGuard {
+    fn drop(&mut self) {
+        rest_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.0);
+    }
+}
+
+fn diagnostic_rest_state() -> String {
+    let active = rest_diag().lock().unwrap_or_else(|err| err.into_inner());
+    let mut requests: Vec<String> = active
+        .iter()
+        .map(|(id, request)| {
+            format!(
+                "id={} stage={} elapsed_ms={} path={}",
+                id,
+                request.stage,
+                request.since.elapsed().as_millis(),
+                request.path,
+            )
+        })
+        .collect();
+    requests.sort();
+    if requests.len() > 8 {
+        requests.truncate(8);
+        requests.push("more-requests-omitted".to_owned());
+    }
+    format!("active={} requests=[{}]", active.len(), requests.join("; "))
+}
 
 /// Block source backed entirely by the Bitcoin Core REST interface (for
 /// headers and blocks) and ZMQ (for new-block notifications).
@@ -432,6 +509,7 @@ impl RestConn {
 
     /// GET a path; auto-reconnects once on failure.
     fn get(&mut self, path: &str) -> Result<Vec<u8>> {
+        let diag = RestRequestGuard::new(path);
         let started = Instant::now();
         match self.do_get(path) {
             Ok(body) => {
@@ -453,7 +531,9 @@ impl RestConn {
                     started.elapsed().as_millis(),
                     first_err,
                 );
+                diag.set_stage("reconnect");
                 *self = Self::connect(self.addr)?;
+                diag.set_stage("retry");
                 let retry_started = Instant::now();
                 let result = self.do_get(path);
                 match &result {
@@ -619,9 +699,11 @@ fn spawn_zmq_listener(endpoint: &str) -> Result<Receiver<()>> {
                 payload_hex,
             ),
             Err(TrySendError::Full(())) => warn!(
-                "[blake2b-diag] ZMQ block wakeup DROPPED reason=receiver-not-ready topic={} hash_raw={}",
+                "[blake2b-diag] ZMQ block wakeup DROPPED reason=receiver-not-ready topic={} hash_raw={} server_state={} rest_state={}",
                 String::from_utf8_lossy(&topic),
                 payload_hex,
+                crate::server::diagnostic_server_state(),
+                diagnostic_rest_state(),
             ),
             Err(TrySendError::Disconnected(())) => {
                 error!(

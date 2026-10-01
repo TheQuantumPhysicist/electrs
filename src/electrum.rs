@@ -36,6 +36,12 @@ pub struct Client {
     negotiated: Option<&'static str>,
 }
 
+impl Client {
+    pub(crate) fn diagnostic_state(&self) -> (bool, usize, Option<&'static str>) {
+        (self.tip.is_some(), self.scripthashes.len(), self.negotiated)
+    }
+}
+
 #[derive(Deserialize)]
 struct Request {
     id: Value,

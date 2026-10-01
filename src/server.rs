@@ -7,6 +7,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     iter::once,
     net::{Shutdown, TcpListener, TcpStream},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -17,6 +18,94 @@ use crate::{
     signals::ExitError,
     thread::spawn,
 };
+
+struct ServerDiagState {
+    phase: &'static str,
+    since: Instant,
+    detail: String,
+    peer_activity: HashMap<usize, PeerDiagActivity>,
+}
+
+struct PeerDiagActivity {
+    stage: &'static str,
+    since: Instant,
+    detail: String,
+}
+
+static SERVER_DIAG: OnceLock<Mutex<ServerDiagState>> = OnceLock::new();
+
+fn server_diag() -> &'static Mutex<ServerDiagState> {
+    SERVER_DIAG.get_or_init(|| {
+        Mutex::new(ServerDiagState {
+            phase: "startup",
+            since: Instant::now(),
+            detail: String::new(),
+            peer_activity: HashMap::new(),
+        })
+    })
+}
+
+fn set_server_phase(phase: &'static str, detail: String) {
+    let mut state = server_diag().lock().unwrap_or_else(|err| err.into_inner());
+    state.phase = phase;
+    state.since = Instant::now();
+    state.detail = detail;
+    if phase != "notify-peers" {
+        state.peer_activity.clear();
+    }
+}
+
+fn set_peer_activity(peer_id: usize, stage: &'static str, detail: String) {
+    server_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .peer_activity
+        .insert(
+            peer_id,
+            PeerDiagActivity {
+                stage,
+                since: Instant::now(),
+                detail,
+            },
+        );
+}
+
+fn clear_peer_activity(peer_id: usize) {
+    server_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .peer_activity
+        .remove(&peer_id);
+}
+
+pub(crate) fn diagnostic_server_state() -> String {
+    let state = server_diag().lock().unwrap_or_else(|err| err.into_inner());
+    let mut peers: Vec<String> = state
+        .peer_activity
+        .iter()
+        .map(|(peer_id, activity)| {
+            format!(
+                "peer={} stage={} elapsed_ms={} {}",
+                peer_id,
+                activity.stage,
+                activity.since.elapsed().as_millis(),
+                activity.detail,
+            )
+        })
+        .collect();
+    peers.sort();
+    if peers.len() > 8 {
+        peers.truncate(8);
+        peers.push("more-peers-omitted".to_owned());
+    }
+    format!(
+        "phase={} elapsed_ms={} detail=[{}] active_peers=[{}]",
+        state.phase,
+        state.since.elapsed().as_millis(),
+        state.detail,
+        peers.join("; "),
+    )
+}
 
 struct Peer {
     id: usize,
@@ -114,6 +203,14 @@ fn serve() -> Result<()> {
                 );
                 sync_starved = false;
             }
+            set_server_phase(
+                "sync",
+                format!(
+                    "queued_server_events={} peers={}",
+                    server_rx.len(),
+                    peers.len(),
+                ),
+            );
             let sync_started = Instant::now();
             let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?; // sync a batch of blocks
             let sync_elapsed = sync_started.elapsed();
@@ -126,6 +223,7 @@ fn serve() -> Result<()> {
                     peers.len(),
                 );
             }
+            set_server_phase("notify-peers", peer_summary(&peers));
             let notify_started = Instant::now();
             peers = duration.observe_duration("notify", || notify_peers(&rpc, peers)); // peers are disconnected on error
             let notify_elapsed = notify_started.elapsed();
@@ -145,6 +243,14 @@ fn serve() -> Result<()> {
             }
             break;
         }
+        set_server_phase(
+            "select-wait",
+            format!(
+                "queued_server_events={} peers={}",
+                server_rx.len(),
+                peers.len(),
+            ),
+        );
         duration.observe_duration("select", || -> Result<()> {
             select! {
                 // Handle signals for graceful shutdown
@@ -156,6 +262,15 @@ fn serve() -> Result<()> {
                 recv(new_block_rx) -> result => match result {
                     Ok(_) => {
                         let pending = server_rx.len();
+                        set_server_phase(
+                            "block-wakeup",
+                            format!(
+                                "queued_server_events={} peers={} since_last_sync_ms={}",
+                                pending,
+                                peers.len(),
+                                last_sync.elapsed().as_millis(),
+                            ),
+                        );
                         if pending == 0 {
                             info!(
                                 "[blake2b-diag] block wakeup consumed since_last_sync_ms={} peers={}",
@@ -183,6 +298,15 @@ fn serve() -> Result<()> {
                     let events: Vec<Event> = first.chain(rest).collect();
                     server_batch_size.observe("recv", events.len() as f64);
                     let event_count = events.len();
+                    set_server_phase(
+                        "electrum-events",
+                        format!(
+                            "events={} queued_after_drain={} peers={}",
+                            event_count,
+                            server_rx.len(),
+                            peers.len(),
+                        ),
+                    );
                     let handle_started = Instant::now();
                     duration.observe_duration("handle", || handle_events(&rpc, &mut peers, events));
                     let handle_elapsed = handle_started.elapsed();
@@ -206,21 +330,37 @@ fn serve() -> Result<()> {
 fn notify_peers(rpc: &Rpc, peers: HashMap<usize, Peer>) -> HashMap<usize, Peer> {
     peers
         .into_par_iter()
-        .filter_map(|(_, mut peer)| match notify_peer(rpc, &mut peer) {
-            Ok(()) => Some((peer.id, peer)),
-            Err(e) => {
-                error!("failed to notify peer {}: {:#}", peer.id, e);
-                peer.disconnect();
-                None
+        .filter_map(|(_, mut peer)| {
+            let result = notify_peer(rpc, &mut peer);
+            clear_peer_activity(peer.id);
+            match result {
+                Ok(()) => Some((peer.id, peer)),
+                Err(e) => {
+                    error!("failed to notify peer {}: {:#}", peer.id, e);
+                    peer.disconnect();
+                    None
+                }
             }
         })
         .collect()
 }
 
 fn notify_peer(rpc: &Rpc, peer: &mut Peer) -> Result<()> {
+    let summary = client_summary(&peer.client);
+    set_peer_activity(peer.id, "update-client", summary.clone());
     let notifications = rpc
         .update_client(&mut peer.client)
         .context("failed to generate notifications")?;
+    set_peer_activity(
+        peer.id,
+        "send-notifications",
+        format!(
+            "{} notifications={} response_bytes={}",
+            summary,
+            notifications.len(),
+            notifications.iter().map(String::len).sum::<usize>(),
+        ),
+    );
     peer.send(notifications)
         .context("failed to send notifications")
 }
@@ -269,6 +409,17 @@ fn handle_peer_events(
     }
     let result = match peers.get_mut(&peer_id) {
         Some(peer) => {
+            let methods = request_method_summary(&lines);
+            set_server_phase(
+                "peer-request",
+                format!(
+                    "peer={} lines={} methods={} {}",
+                    peer_id,
+                    lines.len(),
+                    methods,
+                    client_summary(&peer.client),
+                ),
+            );
             let request_started = Instant::now();
             let responses = rpc.handle_requests(&mut peer.client, &lines);
             let request_elapsed = request_started.elapsed();
@@ -278,9 +429,19 @@ fn handle_peer_events(
                     peer_id,
                     lines.len(),
                     request_elapsed.as_millis(),
-                    request_method_summary(&lines),
+                    methods,
                 );
             }
+            set_server_phase(
+                "peer-response-send",
+                format!(
+                    "peer={} responses={} response_bytes={} {}",
+                    peer_id,
+                    responses.len(),
+                    responses.iter().map(String::len).sum::<usize>(),
+                    client_summary(&peer.client),
+                ),
+            );
             peer.send(responses)
         }
         None => return, // unknown peer
@@ -291,6 +452,33 @@ fn handle_peer_events(
     } else if done {
         peers.remove(&peer_id); // already disconnected, just remove from peers' map
     }
+}
+
+fn client_summary(client: &Client) -> String {
+    let (header_subscribed, scripthashes, negotiated) = client.diagnostic_state();
+    format!(
+        "header_subscribed={} scripthashes={} protocol={}",
+        header_subscribed,
+        scripthashes,
+        negotiated.unwrap_or("none"),
+    )
+}
+
+fn peer_summary(peers: &HashMap<usize, Peer>) -> String {
+    let total_scripthashes = peers
+        .values()
+        .map(|peer| peer.client.diagnostic_state().1)
+        .sum::<usize>();
+    let header_subscribers = peers
+        .values()
+        .filter(|peer| peer.client.diagnostic_state().0)
+        .count();
+    format!(
+        "peers={} header_subscribers={} total_scripthashes={}",
+        peers.len(),
+        header_subscribers,
+        total_scripthashes,
+    )
 }
 
 fn request_method_summary(lines: &[String]) -> String {
