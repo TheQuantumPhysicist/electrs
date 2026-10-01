@@ -9,9 +9,15 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, value::RawValue, Value};
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex as StdMutex, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use crate::connection::{make_p2p_connection, make_rpc_zmq_connection, BlockSource};
 use crate::{
@@ -102,6 +108,116 @@ fn rpc_connect(config: &Config) -> Result<Client> {
 pub struct Daemon {
     block_source: Mutex<Box<dyn BlockSource>>,
     rpc: Client,
+}
+
+struct BlockSourceDiagEntry {
+    started: Instant,
+    phase_started: Instant,
+    operation: &'static str,
+    phase: &'static str,
+    count: usize,
+}
+
+static BLOCK_SOURCE_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static BLOCK_SOURCE_DIAG: OnceLock<StdMutex<HashMap<u64, BlockSourceDiagEntry>>> = OnceLock::new();
+
+fn block_source_diag() -> &'static StdMutex<HashMap<u64, BlockSourceDiagEntry>> {
+    BLOCK_SOURCE_DIAG.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn diagnostic_block_source_state() -> String {
+    let active = block_source_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut entries: Vec<String> = active
+        .iter()
+        .map(|(id, entry)| {
+            format!(
+                "id={} op={} total_ms={} phase={} phase_ms={} count={}",
+                id,
+                entry.operation,
+                entry.started.elapsed().as_millis(),
+                entry.phase,
+                entry.phase_started.elapsed().as_millis(),
+                entry.count,
+            )
+        })
+        .collect();
+    entries.sort();
+    if entries.len() > 8 {
+        entries.truncate(8);
+        entries.push("more-block-source-calls-omitted".to_owned());
+    }
+    format!("active={} calls=[{}]", active.len(), entries.join("; "))
+}
+
+struct BlockSourceDiagGuard {
+    id: u64,
+}
+
+impl BlockSourceDiagGuard {
+    fn new(operation: &'static str, count: usize) -> Self {
+        let id = BLOCK_SOURCE_DIAG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        block_source_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                id,
+                BlockSourceDiagEntry {
+                    started: now,
+                    phase_started: now,
+                    operation,
+                    phase: "waiting-lock",
+                    count,
+                },
+            );
+        Self { id }
+    }
+
+    fn set_phase(&self, phase: &'static str) {
+        let mut active = block_source_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = active.get_mut(&self.id) {
+            let elapsed = entry.phase_started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow block-source phase id={} op={} phase={} elapsed_ms={} count={}",
+                    self.id,
+                    entry.operation,
+                    entry.phase,
+                    elapsed.as_millis(),
+                    entry.count,
+                );
+            }
+            entry.phase = phase;
+            entry.phase_started = Instant::now();
+        }
+    }
+}
+
+impl Drop for BlockSourceDiagGuard {
+    fn drop(&mut self) {
+        let entry = block_source_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.id);
+        if let Some(entry) = entry {
+            let elapsed = entry.started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow block-source call id={} op={} elapsed_ms={} final_phase={} final_phase_ms={} count={}",
+                    self.id,
+                    entry.operation,
+                    elapsed.as_millis(),
+                    entry.phase,
+                    entry.phase_started.elapsed().as_millis(),
+                    entry.count,
+                );
+            }
+        }
+    }
 }
 
 impl Daemon {
@@ -301,7 +417,19 @@ impl Daemon {
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
         let started = std::time::Instant::now();
-        let result = self.block_source.lock().get_new_headers(chain);
+        let diag = BlockSourceDiagGuard::new("get-new-headers", 0);
+        let lock_started = Instant::now();
+        let mut block_source = self.block_source.lock();
+        let lock_elapsed = lock_started.elapsed();
+        if lock_elapsed >= Duration::from_secs(10) {
+            warn!(
+                "[blake2b-diag] block-source lock wait op=get-new-headers elapsed_ms={}",
+                lock_elapsed.as_millis(),
+            );
+        }
+        diag.set_phase("inside-source");
+        let result = block_source.get_new_headers(chain);
+        drop(block_source);
         match &result {
             Ok(headers) if !headers.is_empty() => info!(
                 "[blake2b-diag] header sync discovered count={} from_local_height={} elapsed_ms={}",
@@ -324,9 +452,20 @@ impl Daemon {
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock) + 'a,
     {
-        self.block_source
-            .lock()
-            .for_blocks(blockhashes.into_iter().collect(), Box::new(func))
+        let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
+        let diag = BlockSourceDiagGuard::new("for-blocks", blockhashes.len());
+        let lock_started = Instant::now();
+        let mut block_source = self.block_source.lock();
+        let lock_elapsed = lock_started.elapsed();
+        if lock_elapsed >= Duration::from_secs(10) {
+            warn!(
+                "[blake2b-diag] block-source lock wait op=for-blocks elapsed_ms={} count={}",
+                lock_elapsed.as_millis(),
+                blockhashes.len(),
+            );
+        }
+        diag.set_phase("inside-source");
+        block_source.for_blocks(blockhashes, Box::new(func))
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {

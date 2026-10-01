@@ -37,8 +37,186 @@ struct RestRequestGuard(u64);
 static REST_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static REST_DIAG_ACTIVE: OnceLock<Mutex<HashMap<u64, RestRequestDiag>>> = OnceLock::new();
 
+struct ForBlocksWorkerDiag {
+    stage: &'static str,
+    since: Instant,
+    completed: usize,
+    assigned: usize,
+}
+
+struct ForBlocksDiag {
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    total: usize,
+    received: usize,
+    processed: usize,
+    pending: usize,
+    workers: HashMap<usize, ForBlocksWorkerDiag>,
+}
+
+struct ForBlocksDiagGuard(u64);
+
+static FOR_BLOCKS_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static FOR_BLOCKS_DIAG_ACTIVE: OnceLock<Mutex<HashMap<u64, ForBlocksDiag>>> = OnceLock::new();
+
 fn rest_diag() -> &'static Mutex<HashMap<u64, RestRequestDiag>> {
     REST_DIAG_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn for_blocks_diag() -> &'static Mutex<HashMap<u64, ForBlocksDiag>> {
+    FOR_BLOCKS_DIAG_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl ForBlocksDiagGuard {
+    fn new(total: usize) -> Self {
+        let id = FOR_BLOCKS_DIAG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        for_blocks_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                id,
+                ForBlocksDiag {
+                    started: now,
+                    phase_started: now,
+                    phase: "start",
+                    total,
+                    received: 0,
+                    processed: 0,
+                    pending: 0,
+                    workers: HashMap::new(),
+                },
+            );
+        Self(id)
+    }
+
+    fn id(&self) -> u64 {
+        self.0
+    }
+
+    fn set_phase(&self, phase: &'static str) {
+        let mut active = for_blocks_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = active.get_mut(&self.0) {
+            let elapsed = entry.phase_started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow REST for_blocks phase id={} phase={} elapsed_ms={} total={} received={} processed={} pending={}",
+                    self.0,
+                    entry.phase,
+                    elapsed.as_millis(),
+                    entry.total,
+                    entry.received,
+                    entry.processed,
+                    entry.pending,
+                );
+            }
+            entry.phase = phase;
+            entry.phase_started = Instant::now();
+        }
+    }
+
+    fn progress(&self, received: usize, processed: usize, pending: usize) {
+        if let Some(entry) = for_blocks_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get_mut(&self.0)
+        {
+            entry.received = received;
+            entry.processed = processed;
+            entry.pending = pending;
+        }
+    }
+}
+
+impl Drop for ForBlocksDiagGuard {
+    fn drop(&mut self) {
+        let entry = for_blocks_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.0);
+        if let Some(entry) = entry {
+            let elapsed = entry.started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow REST for_blocks id={} elapsed_ms={} final_phase={} final_phase_ms={} total={} received={} processed={} pending={}",
+                    self.0,
+                    elapsed.as_millis(),
+                    entry.phase,
+                    entry.phase_started.elapsed().as_millis(),
+                    entry.total,
+                    entry.received,
+                    entry.processed,
+                    entry.pending,
+                );
+            }
+        }
+    }
+}
+
+fn set_for_blocks_worker_stage(
+    call_id: u64,
+    worker_id: usize,
+    stage: &'static str,
+    completed: usize,
+    assigned: usize,
+) {
+    let mut active = for_blocks_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(call) = active.get_mut(&call_id) {
+        call.workers.insert(
+            worker_id,
+            ForBlocksWorkerDiag {
+                stage,
+                since: Instant::now(),
+                completed,
+                assigned,
+            },
+        );
+    }
+}
+
+fn diagnostic_for_blocks_state() -> String {
+    let active = for_blocks_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut calls: Vec<String> = active
+        .iter()
+        .map(|(id, call)| {
+            let mut workers: Vec<String> = call
+                .workers
+                .iter()
+                .map(|(worker_id, worker)| {
+                    format!(
+                        "worker={} stage={} stage_ms={} completed={}/{}",
+                        worker_id,
+                        worker.stage,
+                        worker.since.elapsed().as_millis(),
+                        worker.completed,
+                        worker.assigned,
+                    )
+                })
+                .collect();
+            workers.sort();
+            format!(
+                "id={} total_ms={} phase={} phase_ms={} total={} received={} processed={} pending={} workers=[{}]",
+                id,
+                call.started.elapsed().as_millis(),
+                call.phase,
+                call.phase_started.elapsed().as_millis(),
+                call.total,
+                call.received,
+                call.processed,
+                call.pending,
+                workers.join("; "),
+            )
+        })
+        .collect();
+    calls.sort();
+    format!("active={} calls=[{}]", active.len(), calls.join("; "))
 }
 
 impl RestRequestGuard {
@@ -97,7 +275,12 @@ fn diagnostic_rest_state() -> String {
         requests.truncate(8);
         requests.push("more-requests-omitted".to_owned());
     }
-    format!("active={} requests=[{}]", active.len(), requests.join("; "))
+    format!(
+        "active={} requests=[{}] for_blocks={}",
+        active.len(),
+        requests.join("; "),
+        diagnostic_for_blocks_state(),
+    )
 }
 
 /// Block source backed entirely by the Bitcoin Core REST interface (for
@@ -396,6 +579,9 @@ impl BlockSource for RestZmqBlockSource {
             return Ok(());
         }
 
+        let diag = ForBlocksDiagGuard::new(blockhashes.len());
+        diag.set_phase("partition-work");
+
         debug!(
             "REST: fetching {} blocks ({} connections)",
             blockhashes.len(),
@@ -416,6 +602,8 @@ impl BlockSource for RestZmqBlockSource {
             let (tx, rx) = bounded::<(usize, BlockHash, SerBlock)>(BLOCK_CHANNEL_DEPTH);
 
             std::thread::scope(|s| {
+                diag.set_phase("spawn-workers");
+                let call_id = diag.id();
                 // Spawn fetcher threads, each borrowing a persistent connection.
                 let fetchers: Vec<_> = work
                     .into_iter()
@@ -423,17 +611,42 @@ impl BlockSource for RestZmqBlockSource {
                     .enumerate()
                     .map(|(conn_id, (assignments, conn))| {
                         let tx = tx.clone();
+                        let assigned = assignments.len();
+                        set_for_blocks_worker_stage(call_id, conn_id, "starting", 0, assigned);
                         s.spawn(move || {
                             let mut err = None;
+                            let mut completed = 0;
                             for (idx, hash) in assignments {
+                                set_for_blocks_worker_stage(
+                                    call_id,
+                                    conn_id,
+                                    "rest-get",
+                                    completed,
+                                    assigned,
+                                );
                                 let path = format!("/rest/block/{}.bin", hash);
                                 match conn.get(&path) {
                                     Ok(block) => {
+                                        set_for_blocks_worker_stage(
+                                            call_id,
+                                            conn_id,
+                                            "channel-send",
+                                            completed,
+                                            assigned,
+                                        );
                                         if tx.send((idx, hash, block)).is_err() {
                                             break;
                                         }
+                                        completed += 1;
                                     }
                                     Err(e) => {
+                                        set_for_blocks_worker_stage(
+                                            call_id,
+                                            conn_id,
+                                            "error",
+                                            completed,
+                                            assigned,
+                                        );
                                         err = Some(e.context(format!(
                                             "REST conn {}: block {}",
                                             conn_id, hash
@@ -442,6 +655,13 @@ impl BlockSource for RestZmqBlockSource {
                                     }
                                 }
                             }
+                            set_for_blocks_worker_stage(
+                                call_id,
+                                conn_id,
+                                "done",
+                                completed,
+                                assigned,
+                            );
                             err
                         })
                     })
@@ -453,20 +673,29 @@ impl BlockSource for RestZmqBlockSource {
                 // Reorder buffer: blocks arrive out of order, consumer needs
                 // them in sequence.
                 let mut next_idx = 0;
+                let mut received = 0;
                 let mut pending: std::collections::HashMap<usize, (BlockHash, SerBlock)> =
                     std::collections::HashMap::new();
 
+                diag.set_phase("receive-channel");
                 for (idx, hash, block) in rx {
+                    received += 1;
                     pending.insert(idx, (hash, block));
+                    diag.progress(received, next_idx, pending.len());
 
                     // Flush all consecutive ready blocks.
                     while let Some((h, b)) = pending.remove(&next_idx) {
+                        diag.set_phase("process-block");
+                        diag.progress(received, next_idx, pending.len());
                         blocks_duration.observe_duration("process", || func(h, b));
                         next_idx += 1;
+                        diag.progress(received, next_idx, pending.len());
+                        diag.set_phase("receive-channel");
                     }
                 }
 
                 // Check for fetcher errors.
+                diag.set_phase("join-workers");
                 let mut first_err = None;
                 for f in fetchers {
                     let err = f.join().expect("fetcher panicked");
@@ -479,6 +708,7 @@ impl BlockSource for RestZmqBlockSource {
                     return Err(e);
                 }
 
+                diag.set_phase("complete");
                 assert_eq!(next_idx, blockhashes.len(), "not all blocks were processed");
                 Ok(())
             })

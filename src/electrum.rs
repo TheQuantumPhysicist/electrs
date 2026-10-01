@@ -11,6 +11,11 @@ use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::iter::FromIterator;
 use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use crate::{
     cache::Cache,
@@ -27,6 +32,117 @@ use crate::{
 const UNKNOWN_FEE: isize = -1; // (allowed by Electrum protocol)
 
 const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method of querying electrs, consider contacting the developer of your wallet. Reason:";
+
+struct SubscribeDiagEntry {
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    requested: usize,
+    new_count: usize,
+}
+
+static SUBSCRIBE_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static SUBSCRIBE_DIAG: OnceLock<Mutex<HashMap<u64, SubscribeDiagEntry>>> = OnceLock::new();
+
+fn subscribe_diag() -> &'static Mutex<HashMap<u64, SubscribeDiagEntry>> {
+    SUBSCRIBE_DIAG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn diagnostic_subscribe_state() -> String {
+    let active = subscribe_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut entries: Vec<String> = active
+        .iter()
+        .map(|(id, entry)| {
+            format!(
+                "id={} total_ms={} phase={} phase_ms={} requested={} new={}",
+                id,
+                entry.started.elapsed().as_millis(),
+                entry.phase,
+                entry.phase_started.elapsed().as_millis(),
+                entry.requested,
+                entry.new_count,
+            )
+        })
+        .collect();
+    entries.sort();
+    if entries.len() > 8 {
+        entries.truncate(8);
+        entries.push("more-subscriptions-omitted".to_owned());
+    }
+    format!("active={} calls=[{}]", active.len(), entries.join("; "))
+}
+
+struct SubscribeDiagGuard {
+    id: u64,
+}
+
+impl SubscribeDiagGuard {
+    fn new(requested: usize) -> Self {
+        let id = SUBSCRIBE_DIAG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        subscribe_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                id,
+                SubscribeDiagEntry {
+                    started: now,
+                    phase_started: now,
+                    phase: "filter-existing",
+                    requested,
+                    new_count: 0,
+                },
+            );
+        Self { id }
+    }
+
+    fn set_phase(&self, phase: &'static str, new_count: usize) {
+        let mut active = subscribe_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = active.get_mut(&self.id) {
+            let elapsed = entry.phase_started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow subscribe phase id={} phase={} elapsed_ms={} requested={} new={}",
+                    self.id,
+                    entry.phase,
+                    elapsed.as_millis(),
+                    entry.requested,
+                    entry.new_count,
+                );
+            }
+            entry.phase = phase;
+            entry.phase_started = Instant::now();
+            entry.new_count = new_count;
+        }
+    }
+}
+
+impl Drop for SubscribeDiagGuard {
+    fn drop(&mut self) {
+        let entry = subscribe_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.id);
+        if let Some(entry) = entry {
+            let elapsed = entry.started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow subscribe id={} elapsed_ms={} final_phase={} final_phase_ms={} requested={} new={}",
+                    self.id,
+                    elapsed.as_millis(),
+                    entry.phase,
+                    entry.phase_started.elapsed().as_millis(),
+                    entry.requested,
+                    entry.new_count,
+                );
+            }
+        }
+    }
+}
 
 /// Per-client Electrum protocol state
 #[derive(Default)]
@@ -360,16 +476,19 @@ impl Rpc {
         client: &'a mut Client,
         scripthashes: &'a [ScriptHash],
     ) -> impl Iterator<Item = Result<Value>> + 'a {
+        let diag = SubscribeDiagGuard::new(scripthashes.len());
         let new_scripthashes: Vec<ScriptHash> = scripthashes
             .iter()
             .copied()
             .filter(|scripthash| !client.scripthashes.contains_key(scripthash))
             .collect();
 
+        diag.set_phase("rayon-new-status", new_scripthashes.len());
         let mut results: HashMap<ScriptHash, Result<ScriptHashStatus>> = new_scripthashes
             .into_par_iter()
             .map(|scripthash| (scripthash, self.new_status(scripthash)))
             .collect();
+        diag.set_phase("build-results", results.len());
 
         scripthashes.iter().map(move |scripthash| {
             let statushash = match client.scripthashes.entry(*scripthash) {

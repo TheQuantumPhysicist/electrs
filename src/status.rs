@@ -14,6 +14,11 @@ use std::convert::TryFrom;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::ControlFlow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -24,6 +29,112 @@ use crate::{
     mempool::Mempool,
     types::{bsl_txid, ScriptHash, SerBlock, StatusHash},
 };
+
+struct StatusSyncDiagEntry {
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    detail: String,
+}
+
+static STATUS_SYNC_DIAG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static STATUS_SYNC_DIAG: OnceLock<Mutex<HashMap<u64, StatusSyncDiagEntry>>> = OnceLock::new();
+
+fn status_sync_diag() -> &'static Mutex<HashMap<u64, StatusSyncDiagEntry>> {
+    STATUS_SYNC_DIAG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn diagnostic_status_state() -> String {
+    let active = status_sync_diag()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut entries: Vec<String> = active
+        .iter()
+        .map(|(id, entry)| {
+            format!(
+                "id={} total_ms={} phase={} phase_ms={} detail=[{}]",
+                id,
+                entry.started.elapsed().as_millis(),
+                entry.phase,
+                entry.phase_started.elapsed().as_millis(),
+                entry.detail,
+            )
+        })
+        .collect();
+    entries.sort();
+    if entries.len() > 8 {
+        entries.truncate(8);
+        entries.push("more-status-syncs-omitted".to_owned());
+    }
+    format!("active={} syncs=[{}]", active.len(), entries.join("; "))
+}
+
+struct StatusSyncDiagGuard {
+    id: u64,
+}
+
+impl StatusSyncDiagGuard {
+    fn new() -> Self {
+        let id = STATUS_SYNC_DIAG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        status_sync_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                id,
+                StatusSyncDiagEntry {
+                    started: now,
+                    phase_started: now,
+                    phase: "start",
+                    detail: String::new(),
+                },
+            );
+        Self { id }
+    }
+
+    fn set_phase(&self, phase: &'static str, detail: String) {
+        let mut active = status_sync_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = active.get_mut(&self.id) {
+            let phase_elapsed = entry.phase_started.elapsed();
+            if phase_elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow status phase id={} phase={} elapsed_ms={} detail=[{}]",
+                    self.id,
+                    entry.phase,
+                    phase_elapsed.as_millis(),
+                    entry.detail,
+                );
+            }
+            entry.phase = phase;
+            entry.phase_started = Instant::now();
+            entry.detail = detail;
+        }
+    }
+}
+
+impl Drop for StatusSyncDiagGuard {
+    fn drop(&mut self) {
+        let entry = status_sync_diag()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.id);
+        if let Some(entry) = entry {
+            let elapsed = entry.started.elapsed();
+            if elapsed >= Duration::from_secs(10) {
+                warn!(
+                    "[blake2b-diag] slow status sync id={} elapsed_ms={} final_phase={} final_phase_ms={} detail=[{}]",
+                    self.id,
+                    elapsed.as_millis(),
+                    entry.phase,
+                    entry.phase_started.elapsed().as_millis(),
+                    entry.detail,
+                );
+            }
+        }
+    }
+}
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
 struct TxEntry {
@@ -335,16 +446,53 @@ impl ScriptHashStatus {
         daemon: &Daemon,
         cache: &Cache,
         outpoints: &mut HashSet<OutPoint>,
+        diag: &StatusSyncDiagGuard,
     ) -> Result<HashMap<BlockHash, Vec<TxEntry>>> {
         // Will be updated during the following block scans
         let mut result = HashMap::<BlockHash, HashMap<usize, TxEntry>>::new();
 
+        diag.set_phase(
+            "funding-index-lookup",
+            format!("confirmed_blocks={}", self.confirmed.len()),
+        );
         let funding_blockhashes = index.limit_result(index.filter_by_funding(self.scripthash))?;
+        let funding_candidates = funding_blockhashes.len();
+        let funding_new_blocks = funding_blockhashes
+            .iter()
+            .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
+            .count();
+        diag.set_phase(
+            "funding-block-fetch",
+            format!(
+                "candidates={} new_blocks={} already_confirmed={} processed=0",
+                funding_candidates,
+                funding_new_blocks,
+                funding_candidates.saturating_sub(funding_new_blocks),
+            ),
+        );
+        let mut funding_processed = 0usize;
         self.for_new_blocks(funding_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
             // extract relevant funding transactions
-            for filtered_outputs in filter_block_txs_outputs(block, self.scripthash) {
+            diag.set_phase(
+                "funding-block-scan",
+                format!(
+                    "processed={} total={}",
+                    funding_processed, funding_new_blocks
+                ),
+            );
+            let filtered_outputs = filter_block_txs_outputs(block, self.scripthash);
+            diag.set_phase(
+                "funding-block-apply",
+                format!(
+                    "processed={} total={} matching_txs={}",
+                    funding_processed,
+                    funding_new_blocks,
+                    filtered_outputs.len(),
+                ),
+            );
+            for filtered_outputs in filtered_outputs {
                 cache.add_tx(filtered_outputs.txid, move || filtered_outputs.tx_bytes);
                 // store funded outpoints (to check for spending later)
                 outpoints.extend(make_outpoints(
@@ -356,23 +504,89 @@ impl ScriptHashStatus {
                     .or_insert_with(|| TxEntry::new(filtered_outputs.txid))
                     .outputs = filtered_outputs.result;
             }
+            funding_processed += 1;
+            diag.set_phase(
+                "funding-block-fetch",
+                format!(
+                    "candidates={} new_blocks={} already_confirmed={} processed={}",
+                    funding_candidates,
+                    funding_new_blocks,
+                    funding_candidates.saturating_sub(funding_new_blocks),
+                    funding_processed,
+                ),
+            );
         })?;
+
+        diag.set_phase(
+            "spending-index-lookup",
+            format!("outpoints={}", outpoints.len()),
+        );
         let spending_blockhashes: HashSet<BlockHash> = outpoints
             .par_iter() // use rayon for concurrent index lookups
             .flat_map_iter(|outpoint| index.filter_by_spending(*outpoint))
             .collect();
+        let spending_candidates = spending_blockhashes.len();
+        let spending_new_blocks = spending_blockhashes
+            .iter()
+            .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
+            .count();
+        diag.set_phase(
+            "spending-block-fetch",
+            format!(
+                "outpoints={} candidates={} new_blocks={} already_confirmed={} processed=0",
+                outpoints.len(),
+                spending_candidates,
+                spending_new_blocks,
+                spending_candidates.saturating_sub(spending_new_blocks),
+            ),
+        );
+        let mut spending_processed = 0usize;
         self.for_new_blocks(spending_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
             // extract relevant spending transactions
-            for filtered_inputs in filter_block_txs_inputs(&block, outpoints) {
+            diag.set_phase(
+                "spending-block-scan",
+                format!(
+                    "processed={} total={}",
+                    spending_processed, spending_new_blocks
+                ),
+            );
+            let filtered_inputs = filter_block_txs_inputs(&block, outpoints);
+            diag.set_phase(
+                "spending-block-apply",
+                format!(
+                    "processed={} total={} matching_txs={}",
+                    spending_processed,
+                    spending_new_blocks,
+                    filtered_inputs.len(),
+                ),
+            );
+            for filtered_inputs in filtered_inputs {
                 cache.add_tx(filtered_inputs.txid, move || filtered_inputs.tx_bytes);
                 block_entries
                     .entry(filtered_inputs.pos) // the transaction may already exist
                     .or_insert_with(|| TxEntry::new(filtered_inputs.txid))
                     .spent = filtered_inputs.result;
             }
+            spending_processed += 1;
+            diag.set_phase(
+                "spending-block-fetch",
+                format!(
+                    "outpoints={} candidates={} new_blocks={} already_confirmed={} processed={}",
+                    outpoints.len(),
+                    spending_candidates,
+                    spending_new_blocks,
+                    spending_candidates.saturating_sub(spending_new_blocks),
+                    spending_processed,
+                ),
+            );
         })?;
+
+        diag.set_phase(
+            "confirmed-finalize",
+            format!("result_blocks={} outpoints={}", result.len(), outpoints.len()),
+        );
 
         Ok(result
             .into_iter()
@@ -432,11 +646,20 @@ impl ScriptHashStatus {
         daemon: &Daemon,
         cache: &Cache,
     ) -> Result<()> {
+        let diag = StatusSyncDiagGuard::new();
+        diag.set_phase(
+            "confirmed-outpoints",
+            format!("confirmed_blocks={}", self.confirmed.len()),
+        );
         let mut outpoints: HashSet<OutPoint> = self.confirmed_outpoints(index.chain());
 
+        diag.set_phase(
+            "tip-check",
+            format!("confirmed_blocks={} outpoints={}", self.confirmed.len(), outpoints.len()),
+        );
         let new_tip = index.chain().tip();
         if self.tip != new_tip {
-            let update = self.sync_confirmed(index, daemon, cache, &mut outpoints)?;
+            let update = self.sync_confirmed(index, daemon, cache, &mut outpoints, &diag)?;
             self.confirmed.extend(update); // add new blocks to the map
             self.tip = new_tip;
         }
@@ -447,17 +670,43 @@ impl ScriptHashStatus {
                 self.confirmed.len()
             );
         }
+
+        diag.set_phase(
+            "mempool-sync",
+            format!("outpoints={} confirmed_blocks={}", outpoints.len(), self.confirmed.len()),
+        );
         self.mempool = self.sync_mempool(mempool, cache, &mut outpoints);
         if !self.mempool.is_empty() {
             debug!("{} mempool transactions", self.mempool.len());
         }
         // update history entries and status hash
+        diag.set_phase(
+            "history-build",
+            format!(
+                "confirmed_blocks={} mempool_entries={}",
+                self.confirmed.len(),
+                self.mempool.len(),
+            ),
+        );
         self.history.clear();
         self.history
             .extend(self.get_confirmed_history(index.chain()));
         self.history.extend(self.get_mempool_history(mempool));
 
+        diag.set_phase(
+            "status-hash",
+            format!("history_entries={}", self.history.len()),
+        );
         self.statushash = compute_status_hash(&self.history);
+        diag.set_phase(
+            "done",
+            format!(
+                "history_entries={} outpoints={} confirmed_blocks={}",
+                self.history.len(),
+                outpoints.len(),
+                self.confirmed.len(),
+            ),
+        );
         Ok(())
     }
 

@@ -99,11 +99,15 @@ pub(crate) fn diagnostic_server_state() -> String {
         peers.push("more-peers-omitted".to_owned());
     }
     format!(
-        "phase={} elapsed_ms={} detail=[{}] active_peers=[{}]",
+        "phase={} elapsed_ms={} detail=[{}] active_peers=[{}] subscribe_state={} status_state={} block_source_state={} cache_state={}",
         state.phase,
         state.since.elapsed().as_millis(),
         state.detail,
         peers.join("; "),
+        crate::electrum::diagnostic_subscribe_state(),
+        crate::status::diagnostic_status_state(),
+        crate::daemon::diagnostic_block_source_state(),
+        crate::cache::diagnostic_cache_state(),
     )
 }
 
