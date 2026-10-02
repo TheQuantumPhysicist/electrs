@@ -685,6 +685,14 @@ impl ScriptHashStatus {
         );
         let funding_blockhashes = index.limit_result(index.filter_by_funding(self.scripthash))?;
         let funding_candidates = funding_blockhashes.len();
+        if funding_candidates >= FILTER_AUDIT_MIN_CANDIDATES {
+            warn!(
+                "THISISPRIVATE [blake2b-diag] wallet status identity status_id={} scripthash={} funding_candidates={}",
+                diag.id,
+                self.scripthash,
+                funding_candidates,
+            );
+        }
         let funding_candidate_audit = candidate_audit(index, funding_blockhashes.iter());
         log_candidate_audit(diag.id, "funding", &funding_candidate_audit);
         let funding_audit_enabled = funding_candidates >= FILTER_AUDIT_MIN_CANDIDATES;
@@ -752,8 +760,25 @@ impl ScriptHashStatus {
                         node_audit.ordinals.sort_unstable();
                         let header_txcount_agrees =
                             layout.header_txcount.map(|n| n == layout.total_txs);
+                        if let Some(script_hex) = node_audit.first_script_hex.as_deref() {
+                            let first_ordinal = node_audit
+                                .ordinals
+                                .first()
+                                .map(|(tx_pos, vout_pos)| format!("{}:{}", tx_pos, vout_pos))
+                                .unwrap_or_else(|| "none".to_owned());
+                            warn!(
+                                "THISISPRIVATE [blake2b-diag] wallet match sample status_id={} height={:?} scripthash={} script_pubkey_hex={} node_address={} txid={} ordinal={}",
+                                diag.id,
+                                height,
+                                self.scripthash,
+                                script_hex,
+                                node_audit.first_address.as_deref().unwrap_or("none"),
+                                node_audit.first_txid.as_deref().unwrap_or("none"),
+                                first_ordinal,
+                            );
+                        }
                         warn!(
-                            "[blake2b-diag] node crosscheck status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} header_txcount_agrees={:?} node_txs={} node_txcount_agrees={} electrs_matches={} node_matches={} agrees={} coinbase_matches={} node_types=[{}] electrs_ordinals=[{}] node_ordinals=[{}]",
+                            "THISISPRIVATE [blake2b-diag] node crosscheck status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} header_txcount_agrees={:?} node_txs={} node_txcount_agrees={} electrs_matches={} node_matches={} agrees={} coinbase_matches={} node_types=[{}] electrs_ordinals=[{}] node_ordinals=[{}]",
                             diag.id,
                             height,
                             layout.header_bytes,
@@ -775,7 +800,7 @@ impl ScriptHashStatus {
                         );
                     }
                     Err(err) => warn!(
-                        "[blake2b-diag] node crosscheck failed status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} electrs_matches={} electrs_ordinals=[{}] error={:#}",
+                        "THISISPRIVATE [blake2b-diag] node crosscheck failed status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} electrs_matches={} electrs_ordinals=[{}] error={:#}",
                         diag.id,
                         height,
                         layout.header_bytes,

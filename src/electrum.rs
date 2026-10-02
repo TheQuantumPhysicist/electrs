@@ -477,6 +477,16 @@ impl Rpc {
         scripthashes: &'a [ScriptHash],
     ) -> impl Iterator<Item = Result<Value>> + 'a {
         let diag = SubscribeDiagGuard::new(scripthashes.len());
+        for (subscription_index, scripthash) in scripthashes.iter().enumerate() {
+            warn!(
+                "THISISPRIVATE [blake2b-diag] wallet subscription subscribe_id={} subscription_index={} requested={} already_subscribed={} scripthash={}",
+                diag.id,
+                subscription_index,
+                scripthashes.len(),
+                client.scripthashes.contains_key(scripthash),
+                scripthash,
+            );
+        }
         let new_scripthashes: Vec<ScriptHash> = scripthashes
             .iter()
             .copied()

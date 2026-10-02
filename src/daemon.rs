@@ -39,6 +39,9 @@ pub(crate) struct DecodedScriptMatchAudit {
     pub(crate) coinbase_matches: usize,
     pub(crate) script_types: Vec<String>,
     pub(crate) total_txs: usize,
+    pub(crate) first_script_hex: Option<String>,
+    pub(crate) first_address: Option<String>,
+    pub(crate) first_txid: Option<String>,
 }
 
 fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
@@ -382,6 +385,9 @@ impl Daemon {
         let mut ordinals = Vec::new();
         let mut coinbase_matches = 0usize;
         let mut script_types = BTreeSet::<String>::new();
+        let mut first_script_hex = None;
+        let mut first_address = None;
+        let mut first_txid = None;
         for (tx_pos, tx) in txs.iter().enumerate() {
             let vouts = tx["vout"]
                 .as_array()
@@ -394,6 +400,13 @@ impl Daemon {
                     .context("decoded output contains invalid scriptPubKey.hex")?;
                 if ScriptHash::hash(&script) == scripthash {
                     ordinals.push((tx_pos, vout_pos));
+                    if first_script_hex.is_none() {
+                        first_script_hex = Some(script_hex.to_owned());
+                        first_address = vout["scriptPubKey"]["address"]
+                            .as_str()
+                            .map(|value| value.to_owned());
+                        first_txid = tx["txid"].as_str().map(|value| value.to_owned());
+                    }
                     if tx_pos == 0 {
                         coinbase_matches += 1;
                     }
@@ -411,6 +424,9 @@ impl Daemon {
             coinbase_matches,
             script_types: script_types.into_iter().collect(),
             total_txs: txs.len(),
+            first_script_hex,
+            first_address,
+            first_txid,
         })
     }
 
