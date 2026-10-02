@@ -3,6 +3,7 @@ use bitcoin::consensus::{deserialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use bitcoin_slices::{bsl, Visitor};
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::thread;
 
@@ -11,12 +12,12 @@ use crate::headerv2::{visit_block_txs, AnyHeader};
 use crate::{
     chain::{Chain, NewHeader},
     daemon::Daemon,
-    db::{DBStore, WriteBatch},
+    db::{DBStore, FundingPrefixAudit, WriteBatch},
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
     types::{
-        bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow,
-        TxidRow,
+        bsl_txid, HashPrefix, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock,
+        SpendingPrefixRow, TxidRow, HASH_PREFIX_LEN,
     },
 };
 
@@ -162,6 +163,18 @@ impl Index {
             .filter_map(move |height| self.chain.get_block_hash(height))
     }
 
+    pub(crate) fn diagnostic_funding_prefix(
+        &self,
+        scripthash: ScriptHash,
+    ) -> FundingPrefixAudit {
+        self.store
+            .diagnostic_funding_prefix(ScriptHashRow::scan_prefix(scripthash))
+    }
+
+    pub(crate) fn diagnostic_lookup_limit(&self) -> Option<usize> {
+        self.lookup_limit
+    }
+
     pub(crate) fn filter_by_spending(
         &self,
         outpoint: OutPoint,
@@ -279,9 +292,19 @@ fn index_single_block(
     struct IndexBlockVisitor<'a> {
         batch: &'a mut WriteBatch,
         height: usize,
+        announced_txs: usize,
+        spendable_outputs: usize,
+        p2wsh_outputs: usize,
+        prefix_selfcheck_failures: usize,
+        full_scripthashes: HashSet<ScriptHash>,
+        prefixes: HashSet<HashPrefix>,
     }
 
     impl Visitor for IndexBlockVisitor<'_> {
+        fn visit_block_begin(&mut self, total_transactions: usize) {
+            self.announced_txs = total_transactions;
+        }
+
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
             let txid = bsl_txid(tx);
             self.batch
@@ -294,8 +317,21 @@ fn index_single_block(
             let script = bitcoin::Script::from_bytes(tx_out.script_pubkey());
             // skip indexing unspendable outputs
             if !script.is_op_return() {
-                let row = ScriptHashRow::row(ScriptHash::new(script), self.height);
-                self.batch.funding_rows.push(row.to_db_row());
+                self.spendable_outputs += 1;
+                let script_bytes = script.as_bytes();
+                if script_bytes.len() == 34 && script_bytes[0] == 0x00 && script_bytes[1] == 0x20 {
+                    self.p2wsh_outputs += 1;
+                }
+
+                let scripthash = ScriptHash::new(script);
+                let prefix = ScriptHashRow::scan_prefix(scripthash);
+                let serialized = ScriptHashRow::row(scripthash, self.height).to_db_row();
+                if serialized[..HASH_PREFIX_LEN] != prefix[..] {
+                    self.prefix_selfcheck_failures += 1;
+                }
+                self.full_scripthashes.insert(scripthash);
+                self.prefixes.insert(prefix);
+                self.batch.funding_rows.push(serialized);
             }
             ControlFlow::Continue(())
         }
@@ -309,7 +345,6 @@ fn index_single_block(
             }
             ControlFlow::Continue(())
         }
-
     }
 
     let header = AnyHeader::parse(&block).expect("core returned an unparseable block header");
@@ -317,8 +352,41 @@ fn index_single_block(
         .header_rows
         .push(HeaderRow::new(header.clone()).to_db_row());
 
-    let mut index_block = IndexBlockVisitor { batch, height };
+    let mut index_block = IndexBlockVisitor {
+        batch,
+        height,
+        announced_txs: 0,
+        spendable_outputs: 0,
+        p2wsh_outputs: 0,
+        prefix_selfcheck_failures: 0,
+        full_scripthashes: HashSet::new(),
+        prefixes: HashSet::new(),
+    };
     visit_block_txs(&block, &header, &mut index_block).expect("core returned invalid block");
+
+    if header.is_v2() || height % 1024 == 0 || index_block.prefix_selfcheck_failures != 0 {
+        let repeated_full_scripts = index_block
+            .spendable_outputs
+            .saturating_sub(index_block.full_scripthashes.len());
+        let prefix_collision_excess = index_block
+            .full_scripthashes
+            .len()
+            .saturating_sub(index_block.prefixes.len());
+        info!(
+            "[blake2b-diag] funding index write audit height={} header_bytes={} txs={} spendable_outputs={} p2wsh_outputs={} unique_full_scripthashes={} unique_prefixes={} repeated_full_scripts={} prefix_collision_excess={} row_bytes={} prefix_selfcheck_failures={}",
+            height,
+            header.size(),
+            index_block.announced_txs,
+            index_block.spendable_outputs,
+            index_block.p2wsh_outputs,
+            index_block.full_scripthashes.len(),
+            index_block.prefixes.len(),
+            repeated_full_scripts,
+            prefix_collision_excess,
+            crate::types::HASH_PREFIX_ROW_SIZE,
+            index_block.prefix_selfcheck_failures,
+        );
+    }
 
     let len = block_hash
         .consensus_encode(&mut (&mut batch.tip_row as &mut [u8]))

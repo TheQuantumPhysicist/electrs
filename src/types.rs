@@ -71,6 +71,10 @@ impl HashPrefixRow {
     pub fn height(&self) -> usize {
         usize::try_from(self.height).expect("invalid height")
     }
+
+    pub(crate) fn prefix(&self) -> HashPrefix {
+        self.prefix
+    }
 }
 
 impl_consensus_encoding!(HashPrefixRow, prefix, height);

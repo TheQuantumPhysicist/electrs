@@ -138,8 +138,8 @@ impl Drop for StatusSyncDiagGuard {
 
 const FILTER_AUDIT_MIN_CANDIDATES: usize = 1_000;
 const FILTER_NODE_CROSSCHECK_MIN_CANDIDATES: usize = 50_000;
-const FILTER_NODE_CROSSCHECK_V1_SAMPLES: usize = 1;
-const FILTER_NODE_CROSSCHECK_V2_SAMPLES: usize = 3;
+const FILTER_NODE_CROSSCHECK_V1_SAMPLES: usize = 4;
+const FILTER_NODE_CROSSCHECK_V2_SAMPLES: usize = 4;
 
 #[derive(Default)]
 struct CandidateAudit {
@@ -226,36 +226,116 @@ fn filter_audit_report_every(total: usize) -> usize {
     std::cmp::max(10_000, total / 10).max(1)
 }
 
+
+#[derive(Debug, Clone, Copy)]
+struct DiagnosticBlockTxLayout {
+    header_bytes: usize,
+    tx_count_bytes: usize,
+    first_tx_offset: usize,
+    total_txs: usize,
+    header_txcount: Option<usize>,
+    legacy_consumed_after_scan_len: usize,
+}
+
+fn diagnostic_block_tx_layout(block: &[u8], header: &AnyHeader) -> Result<DiagnosticBlockTxLayout> {
+    let header_bytes = header.size();
+    if block.len() <= header_bytes {
+        return Err(anyhow::anyhow!(
+            "block is {} bytes, shorter than its own {}-byte header plus a transaction count",
+            block.len(),
+            header_bytes
+        ));
+    }
+
+    // Independent bookkeeping: let scan_len count only the CompactSize bytes.
+    let mut tx_count_bytes = 0usize;
+    let total_txs = bsl::scan_len(&block[header_bytes..], &mut tx_count_bytes)
+        .map_err(|e| anyhow::anyhow!("bad transaction count: {:?}", e))? as usize;
+    let first_tx_offset = header_bytes + tx_count_bytes;
+
+    // Reproduce visit_block_txs's current bookkeeping exactly. scan_len() adds
+    // the CompactSize width to this existing absolute offset. The two offsets
+    // must therefore agree; logging both proves whether `consumed` is behaving
+    // as intended at runtime without changing the parser.
+    let mut legacy_consumed_after_scan_len = header_bytes;
+    let legacy_total_txs = bsl::scan_len(
+        &block[header_bytes..],
+        &mut legacy_consumed_after_scan_len,
+    )
+    .map_err(|e| anyhow::anyhow!("bad transaction count in legacy consumed check: {:?}", e))?
+        as usize;
+    if legacy_total_txs != total_txs || legacy_consumed_after_scan_len != first_tx_offset {
+        return Err(anyhow::anyhow!(
+            "transaction framing disagreement: relative_total={} legacy_total={} first_tx_offset={} legacy_consumed={}",
+            total_txs,
+            legacy_total_txs,
+            first_tx_offset,
+            legacy_consumed_after_scan_len,
+        ));
+    }
+
+    let header_txcount = match header {
+        AnyHeader::V2(h) => Some(h.txcount as usize),
+        AnyHeader::V1(_) => None,
+    };
+
+    Ok(DiagnosticBlockTxLayout {
+        header_bytes,
+        tx_count_bytes,
+        first_tx_offset,
+        total_txs,
+        header_txcount,
+        legacy_consumed_after_scan_len,
+    })
+}
+
+fn evenly_sample_by_height(
+    mut candidates: Vec<(usize, BlockHash)>,
+    target: usize,
+) -> Vec<BlockHash> {
+    if candidates.is_empty() || target == 0 {
+        return Vec::new();
+    }
+    candidates.sort_unstable_by_key(|(height, _)| *height);
+    if candidates.len() <= target {
+        return candidates.into_iter().map(|(_, blockhash)| blockhash).collect();
+    }
+    if target == 1 {
+        return vec![candidates[candidates.len() / 2].1];
+    }
+
+    (0..target)
+        .map(|i| {
+            let idx = i * (candidates.len() - 1) / (target - 1);
+            candidates[idx].1
+        })
+        .collect()
+}
+
 fn audit_sample_candidates(
     index: &Index,
     blockhashes: &[BlockHash],
     confirmed: &HashMap<BlockHash, Vec<TxEntry>>,
 ) -> Vec<BlockHash> {
-    let mut samples = Vec::new();
-    let mut v1 = 0usize;
-    let mut v2 = 0usize;
+    let mut v1 = Vec::<(usize, BlockHash)>::new();
+    let mut v2 = Vec::<(usize, BlockHash)>::new();
 
     for blockhash in blockhashes {
         if confirmed.contains_key(blockhash) {
             continue;
         }
-        match classify_candidate(index, blockhash).1 {
-            Some(false) if v1 < FILTER_NODE_CROSSCHECK_V1_SAMPLES => {
-                samples.push(*blockhash);
-                v1 += 1;
-            }
-            Some(true) if v2 < FILTER_NODE_CROSSCHECK_V2_SAMPLES => {
-                samples.push(*blockhash);
-                v2 += 1;
-            }
+        match classify_candidate(index, blockhash) {
+            (Some(height), Some(false)) => v1.push((height, *blockhash)),
+            (Some(height), Some(true)) => v2.push((height, *blockhash)),
             _ => {}
         }
-        if v1 >= FILTER_NODE_CROSSCHECK_V1_SAMPLES
-            && v2 >= FILTER_NODE_CROSSCHECK_V2_SAMPLES
-        {
-            break;
-        }
     }
+
+    let mut samples = evenly_sample_by_height(v1, FILTER_NODE_CROSSCHECK_V1_SAMPLES);
+    samples.extend(evenly_sample_by_height(
+        v2,
+        FILTER_NODE_CROSSCHECK_V2_SAMPLES,
+    ));
     samples
 }
 
@@ -608,6 +688,27 @@ impl ScriptHashStatus {
         let funding_candidate_audit = candidate_audit(index, funding_blockhashes.iter());
         log_candidate_audit(diag.id, "funding", &funding_candidate_audit);
         let funding_audit_enabled = funding_candidates >= FILTER_AUDIT_MIN_CANDIDATES;
+        if funding_candidates >= FILTER_NODE_CROSSCHECK_MIN_CANDIDATES {
+            let db_audit = index.diagnostic_funding_prefix(self.scripthash);
+            warn!(
+                "[blake2b-diag] funding prefix DB audit status_id={} optimized_candidates={} lookup_limit={:?} seek_key_len={} upper_bound_key_len={:?} expected_row_len={} raw_prefix_rows={} valid_rows={} invalid_key_len_rows={} decoded_prefix_mismatches={} first_key_len={:?} last_key_len={:?} first_nonmatching_key_len={:?} height_min={:?} height_max={:?}",
+                diag.id,
+                funding_candidates,
+                index.diagnostic_lookup_limit(),
+                db_audit.seek_key_len,
+                db_audit.upper_bound_key_len,
+                db_audit.expected_row_len,
+                db_audit.raw_prefix_rows,
+                db_audit.valid_rows,
+                db_audit.invalid_key_len_rows,
+                db_audit.decoded_prefix_mismatches,
+                db_audit.first_key_len,
+                db_audit.last_key_len,
+                db_audit.first_nonmatching_key_len,
+                db_audit.min_height,
+                db_audit.max_height,
+            );
+        }
         let funding_new_blocks = funding_blockhashes
             .iter()
             .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
@@ -641,30 +742,48 @@ impl ScriptHashStatus {
             daemon.for_blocks(audit_samples, |blockhash, block| {
                 let header = AnyHeader::parse(&block)
                     .expect("core returned an unparseable block header during filter audit");
+                let layout = diagnostic_block_tx_layout(&block, &header)
+                    .expect("core returned invalid transaction framing during filter audit");
                 let height = index.chain().get_block_height(&blockhash);
-                let header_bytes = header.size();
                 let electrs_matches =
                     matching_output_ordinals(&filter_block_txs_outputs(block, self.scripthash));
                 match daemon.get_block_script_matches_decoded(blockhash, self.scripthash) {
-                    Ok(mut node_matches) => {
-                        node_matches.sort_unstable();
+                    Ok(mut node_audit) => {
+                        node_audit.ordinals.sort_unstable();
+                        let header_txcount_agrees =
+                            layout.header_txcount.map(|n| n == layout.total_txs);
                         warn!(
-                            "[blake2b-diag] node crosscheck status_id={} kind=funding height={:?} header_bytes={} electrs_matches={} node_matches={} agrees={} electrs_ordinals=[{}] node_ordinals=[{}]",
+                            "[blake2b-diag] node crosscheck status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} header_txcount_agrees={:?} node_txs={} node_txcount_agrees={} electrs_matches={} node_matches={} agrees={} coinbase_matches={} node_types=[{}] electrs_ordinals=[{}] node_ordinals=[{}]",
                             diag.id,
                             height,
-                            header_bytes,
+                            layout.header_bytes,
+                            layout.tx_count_bytes,
+                            layout.first_tx_offset,
+                            layout.legacy_consumed_after_scan_len,
+                            layout.total_txs,
+                            layout.header_txcount,
+                            header_txcount_agrees,
+                            node_audit.total_txs,
+                            layout.total_txs == node_audit.total_txs,
                             electrs_matches.len(),
-                            node_matches.len(),
-                            electrs_matches == node_matches,
+                            node_audit.ordinals.len(),
+                            electrs_matches == node_audit.ordinals,
+                            node_audit.coinbase_matches,
+                            node_audit.script_types.join(","),
                             compact_ordinals(&electrs_matches),
-                            compact_ordinals(&node_matches),
+                            compact_ordinals(&node_audit.ordinals),
                         );
                     }
                     Err(err) => warn!(
-                        "[blake2b-diag] node crosscheck failed status_id={} kind=funding height={:?} header_bytes={} electrs_matches={} electrs_ordinals=[{}] error={:#}",
+                        "[blake2b-diag] node crosscheck failed status_id={} kind=funding height={:?} header_bytes={} tx_count_bytes={} first_tx_offset={} legacy_consumed={} compactsize_txs={} header_txcount={:?} electrs_matches={} electrs_ordinals=[{}] error={:#}",
                         diag.id,
                         height,
-                        header_bytes,
+                        layout.header_bytes,
+                        layout.tx_count_bytes,
+                        layout.first_tx_offset,
+                        layout.legacy_consumed_after_scan_len,
+                        layout.total_txs,
+                        layout.header_txcount,
                         electrs_matches.len(),
                         compact_ordinals(&electrs_matches),
                         err,

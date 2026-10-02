@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::headerv2::{HEADER_V1_SIZE, HEADER_V2_SIZE};
-use crate::types::{HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow};
+use crate::types::{
+    HashPrefix, HashPrefixRow, SerializedHashPrefixRow, SerializedHeaderRow, HASH_PREFIX_ROW_SIZE,
+};
 
 #[derive(Default)]
 pub(crate) struct WriteBatch {
@@ -29,6 +31,33 @@ impl WriteBatch {
 pub struct DBStore {
     db: rocksdb::DB,
     bulk_import: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FundingPrefixAudit {
+    pub(crate) seek_key_len: usize,
+    pub(crate) upper_bound_key_len: Option<usize>,
+    pub(crate) expected_row_len: usize,
+    pub(crate) raw_prefix_rows: usize,
+    pub(crate) valid_rows: usize,
+    pub(crate) invalid_key_len_rows: usize,
+    pub(crate) decoded_prefix_mismatches: usize,
+    pub(crate) first_key_len: Option<usize>,
+    pub(crate) last_key_len: Option<usize>,
+    pub(crate) first_nonmatching_key_len: Option<usize>,
+    pub(crate) min_height: Option<usize>,
+    pub(crate) max_height: Option<usize>,
+}
+
+fn prefix_successor(mut prefix: HashPrefix) -> Option<HashPrefix> {
+    for i in (0..prefix.len()).rev() {
+        if prefix[i] != u8::MAX {
+            prefix[i] += 1;
+            prefix[i + 1..].fill(0);
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 const CONFIG_CF: &str = "config";
@@ -236,6 +265,55 @@ impl DBStore {
         prefix: HashPrefix,
     ) -> impl Iterator<Item = SerializedHashPrefixRow> + '_ {
         self.iter_prefix_cf(self.funding_cf(), prefix)
+    }
+
+    /// Audit the funding column family with a plain seek-and-prefix walk,
+    /// deliberately not using RocksDB's `prefix_same_as_start` optimization.
+    /// This lets diagnostics compare the optimized lookup count with the raw
+    /// key range without exposing the prefix value itself.
+    pub(crate) fn diagnostic_funding_prefix(&self, prefix: HashPrefix) -> FundingPrefixAudit {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.fill_cache(false);
+        let mut raw = self.db.raw_iterator_cf_opt(self.funding_cf(), opts);
+        raw.seek(prefix);
+
+        let mut audit = FundingPrefixAudit {
+            seek_key_len: prefix.len(),
+            upper_bound_key_len: prefix_successor(prefix).map(|bound| bound.len()),
+            expected_row_len: HASH_PREFIX_ROW_SIZE,
+            ..FundingPrefixAudit::default()
+        };
+
+        while let Some(key) = raw.key() {
+            if !key.starts_with(&prefix) {
+                audit.first_nonmatching_key_len = Some(key.len());
+                break;
+            }
+
+            audit.raw_prefix_rows += 1;
+            audit.first_key_len.get_or_insert(key.len());
+            audit.last_key_len = Some(key.len());
+
+            match <SerializedHashPrefixRow>::try_from(key) {
+                Ok(serialized) => {
+                    audit.valid_rows += 1;
+                    let row = HashPrefixRow::from_db_row(serialized);
+                    if row.prefix() != prefix {
+                        audit.decoded_prefix_mismatches += 1;
+                    }
+                    let height = row.height();
+                    audit.min_height =
+                        Some(audit.min_height.map_or(height, |current| current.min(height)));
+                    audit.max_height =
+                        Some(audit.max_height.map_or(height, |current| current.max(height)));
+                }
+                Err(_) => audit.invalid_key_len_rows += 1,
+            }
+
+            raw.next();
+        }
+        raw.status().expect("funding diagnostic scan failed");
+        audit
     }
 
     pub(crate) fn iter_spending(

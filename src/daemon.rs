@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, value::RawValue, Value};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -31,6 +31,14 @@ use crate::{
 enum PollResult {
     Done(Result<()>),
     Retry,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedScriptMatchAudit {
+    pub(crate) ordinals: Vec<(usize, usize)>,
+    pub(crate) coinbase_matches: usize,
+    pub(crate) script_types: Vec<String>,
+    pub(crate) total_txs: usize,
 }
 
 fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
@@ -362,7 +370,7 @@ impl Daemon {
         &self,
         blockhash: BlockHash,
         scripthash: ScriptHash,
-    ) -> Result<Vec<(usize, usize)>> {
+    ) -> Result<DecodedScriptMatchAudit> {
         let block: Value = self
             .rpc
             .call("getblock", &[json!(blockhash), json!(2)])
@@ -371,7 +379,9 @@ impl Daemon {
             .as_array()
             .context("decoded block missing tx array")?;
 
-        let mut matches = Vec::new();
+        let mut ordinals = Vec::new();
+        let mut coinbase_matches = 0usize;
+        let mut script_types = BTreeSet::<String>::new();
         for (tx_pos, tx) in txs.iter().enumerate() {
             let vouts = tx["vout"]
                 .as_array()
@@ -383,11 +393,25 @@ impl Daemon {
                 let script = Vec::<u8>::from_hex(script_hex)
                     .context("decoded output contains invalid scriptPubKey.hex")?;
                 if ScriptHash::hash(&script) == scripthash {
-                    matches.push((tx_pos, vout_pos));
+                    ordinals.push((tx_pos, vout_pos));
+                    if tx_pos == 0 {
+                        coinbase_matches += 1;
+                    }
+                    script_types.insert(
+                        vout["scriptPubKey"]["type"]
+                            .as_str()
+                            .unwrap_or("missing")
+                            .to_owned(),
+                    );
                 }
             }
         }
-        Ok(matches)
+        Ok(DecodedScriptMatchAudit {
+            ordinals,
+            coinbase_matches,
+            script_types: script_types.into_iter().collect(),
+            total_txs: txs.len(),
+        })
     }
 
     pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {
