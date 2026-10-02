@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
+use bitcoin::{consensus::deserialize, hashes::{hex::FromHex, Hash}};
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
@@ -25,7 +25,7 @@ use crate::{
     config::Config,
     metrics::Metrics,
     signals::ExitFlag,
-    types::SerBlock,
+    types::{ScriptHash, SerBlock},
 };
 
 enum PollResult {
@@ -351,6 +351,43 @@ impl Daemon {
             .get_block_info(&blockhash)
             .context("failed to get block txids")?
             .tx)
+    }
+
+    /// Independently find output-script matches using the node's decoded
+    /// `getblock <hash> 2` response rather than electrs's block parser.
+    ///
+    /// This is diagnostic-only data: callers should log only transaction/output
+    /// ordinals, never the script hash or script bytes.
+    pub(crate) fn get_block_script_matches_decoded(
+        &self,
+        blockhash: BlockHash,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<(usize, usize)>> {
+        let block: Value = self
+            .rpc
+            .call("getblock", &[json!(blockhash), json!(2)])
+            .context("failed to get decoded block for filter audit")?;
+        let txs = block["tx"]
+            .as_array()
+            .context("decoded block missing tx array")?;
+
+        let mut matches = Vec::new();
+        for (tx_pos, tx) in txs.iter().enumerate() {
+            let vouts = tx["vout"]
+                .as_array()
+                .context("decoded transaction missing vout array")?;
+            for (vout_pos, vout) in vouts.iter().enumerate() {
+                let script_hex = vout["scriptPubKey"]["hex"]
+                    .as_str()
+                    .context("decoded output missing scriptPubKey.hex")?;
+                let script = Vec::<u8>::from_hex(script_hex)
+                    .context("decoded output contains invalid scriptPubKey.hex")?;
+                if ScriptHash::hash(&script) == scripthash {
+                    matches.push((tx_pos, vout_pos));
+                }
+            }
+        }
+        Ok(matches)
     }
 
     pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {

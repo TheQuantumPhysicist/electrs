@@ -137,6 +137,9 @@ impl Drop for StatusSyncDiagGuard {
 }
 
 const FILTER_AUDIT_MIN_CANDIDATES: usize = 1_000;
+const FILTER_NODE_CROSSCHECK_MIN_CANDIDATES: usize = 50_000;
+const FILTER_NODE_CROSSCHECK_V1_SAMPLES: usize = 1;
+const FILTER_NODE_CROSSCHECK_V2_SAMPLES: usize = 3;
 
 #[derive(Default)]
 struct CandidateAudit {
@@ -221,6 +224,64 @@ fn log_candidate_audit(status_id: u64, kind: &str, audit: &CandidateAudit) {
 
 fn filter_audit_report_every(total: usize) -> usize {
     std::cmp::max(10_000, total / 10).max(1)
+}
+
+fn audit_sample_candidates(
+    index: &Index,
+    blockhashes: &[BlockHash],
+    confirmed: &HashMap<BlockHash, Vec<TxEntry>>,
+) -> Vec<BlockHash> {
+    let mut samples = Vec::new();
+    let mut v1 = 0usize;
+    let mut v2 = 0usize;
+
+    for blockhash in blockhashes {
+        if confirmed.contains_key(blockhash) {
+            continue;
+        }
+        match classify_candidate(index, blockhash).1 {
+            Some(false) if v1 < FILTER_NODE_CROSSCHECK_V1_SAMPLES => {
+                samples.push(*blockhash);
+                v1 += 1;
+            }
+            Some(true) if v2 < FILTER_NODE_CROSSCHECK_V2_SAMPLES => {
+                samples.push(*blockhash);
+                v2 += 1;
+            }
+            _ => {}
+        }
+        if v1 >= FILTER_NODE_CROSSCHECK_V1_SAMPLES
+            && v2 >= FILTER_NODE_CROSSCHECK_V2_SAMPLES
+        {
+            break;
+        }
+    }
+    samples
+}
+
+fn matching_output_ordinals(filtered: &[FilteredTx<TxOutput>]) -> Vec<(usize, usize)> {
+    let mut ordinals = Vec::new();
+    for tx in filtered {
+        for output in &tx.result {
+            ordinals.push((tx.pos, output.index as usize));
+        }
+    }
+    ordinals.sort_unstable();
+    ordinals
+}
+
+fn compact_ordinals(ordinals: &[(usize, usize)]) -> String {
+    const MAX_LOGGED: usize = 8;
+    let mut shown = ordinals
+        .iter()
+        .take(MAX_LOGGED)
+        .map(|(tx, vout)| format!("{}:{}", tx, vout))
+        .collect::<Vec<_>>()
+        .join(",");
+    if ordinals.len() > MAX_LOGGED {
+        shown.push_str(&format!(",+{}more", ordinals.len() - MAX_LOGGED));
+    }
+    shown
 }
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
@@ -566,6 +627,50 @@ impl ScriptHashStatus {
                 funding_unique_new_blocks,
                 funding_candidates.saturating_sub(funding_new_blocks),
             );
+        }
+        if funding_candidates >= FILTER_NODE_CROSSCHECK_MIN_CANDIDATES {
+            let audit_samples =
+                audit_sample_candidates(index, &funding_blockhashes, &self.confirmed);
+            warn!(
+                "[blake2b-diag] node crosscheck plan status_id={} kind=funding samples={} v1_target={} v2_target={}",
+                diag.id,
+                audit_samples.len(),
+                FILTER_NODE_CROSSCHECK_V1_SAMPLES,
+                FILTER_NODE_CROSSCHECK_V2_SAMPLES,
+            );
+            daemon.for_blocks(audit_samples, |blockhash, block| {
+                let header = AnyHeader::parse(&block)
+                    .expect("core returned an unparseable block header during filter audit");
+                let height = index.chain().get_block_height(&blockhash);
+                let header_bytes = header.size();
+                let electrs_matches =
+                    matching_output_ordinals(&filter_block_txs_outputs(block, self.scripthash));
+                match daemon.get_block_script_matches_decoded(blockhash, self.scripthash) {
+                    Ok(mut node_matches) => {
+                        node_matches.sort_unstable();
+                        warn!(
+                            "[blake2b-diag] node crosscheck status_id={} kind=funding height={:?} header_bytes={} electrs_matches={} node_matches={} agrees={} electrs_ordinals=[{}] node_ordinals=[{}]",
+                            diag.id,
+                            height,
+                            header_bytes,
+                            electrs_matches.len(),
+                            node_matches.len(),
+                            electrs_matches == node_matches,
+                            compact_ordinals(&electrs_matches),
+                            compact_ordinals(&node_matches),
+                        );
+                    }
+                    Err(err) => warn!(
+                        "[blake2b-diag] node crosscheck failed status_id={} kind=funding height={:?} header_bytes={} electrs_matches={} electrs_ordinals=[{}] error={:#}",
+                        diag.id,
+                        height,
+                        header_bytes,
+                        electrs_matches.len(),
+                        compact_ordinals(&electrs_matches),
+                        err,
+                    ),
+                }
+            })?;
         }
         diag.set_phase(
             "funding-block-fetch",
