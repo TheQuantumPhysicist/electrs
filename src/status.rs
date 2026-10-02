@@ -27,7 +27,7 @@ use crate::{
     daemon::Daemon,
     index::Index,
     mempool::Mempool,
-    types::{bsl_txid, ScriptHash, SerBlock, StatusHash},
+    types::{bsl_txid, ScriptHash, SerBlock, StatusHash, HASH_PREFIX_LEN},
 };
 
 struct StatusSyncDiagEntry {
@@ -134,6 +134,93 @@ impl Drop for StatusSyncDiagGuard {
             }
         }
     }
+}
+
+const FILTER_AUDIT_MIN_CANDIDATES: usize = 1_000;
+
+#[derive(Default)]
+struct CandidateAudit {
+    entries: usize,
+    unique_blocks: usize,
+    min_height: Option<usize>,
+    max_height: Option<usize>,
+    v1_entries: usize,
+    v2_entries: usize,
+    unknown_entries: usize,
+    v1_unique_blocks: usize,
+    v2_unique_blocks: usize,
+    unknown_unique_blocks: usize,
+}
+
+fn classify_candidate(index: &Index, blockhash: &BlockHash) -> (Option<usize>, Option<bool>) {
+    let Some(height) = index.chain().get_block_height(blockhash) else {
+        return (None, None);
+    };
+    let is_v2 = index
+        .chain()
+        .get_block_header(height)
+        .map(AnyHeader::is_v2);
+    (Some(height), is_v2)
+}
+
+fn candidate_audit<'a>(
+    index: &Index,
+    blockhashes: impl IntoIterator<Item = &'a BlockHash>,
+) -> CandidateAudit {
+    let mut audit = CandidateAudit::default();
+    let mut unique = HashSet::<BlockHash>::new();
+
+    for blockhash in blockhashes {
+        audit.entries += 1;
+        let (height, is_v2) = classify_candidate(index, blockhash);
+        if let Some(height) = height {
+            audit.min_height = Some(audit.min_height.map_or(height, |current| current.min(height)));
+            audit.max_height = Some(audit.max_height.map_or(height, |current| current.max(height)));
+        }
+        match is_v2 {
+            Some(true) => audit.v2_entries += 1,
+            Some(false) => audit.v1_entries += 1,
+            None => audit.unknown_entries += 1,
+        }
+        unique.insert(*blockhash);
+    }
+
+    audit.unique_blocks = unique.len();
+    for blockhash in unique {
+        match classify_candidate(index, &blockhash).1 {
+            Some(true) => audit.v2_unique_blocks += 1,
+            Some(false) => audit.v1_unique_blocks += 1,
+            None => audit.unknown_unique_blocks += 1,
+        }
+    }
+    audit
+}
+
+fn log_candidate_audit(status_id: u64, kind: &str, audit: &CandidateAudit) {
+    if audit.entries < FILTER_AUDIT_MIN_CANDIDATES {
+        return;
+    }
+    warn!(
+        "[blake2b-diag] filter audit status_id={} kind={} prefix_bytes={} candidate_entries={} unique_blocks={} duplicate_entries={} height_min={:?} height_max={:?} v1_entries={} v2_entries={} unknown_entries={} v1_unique_blocks={} v2_unique_blocks={} unknown_unique_blocks={}",
+        status_id,
+        kind,
+        HASH_PREFIX_LEN,
+        audit.entries,
+        audit.unique_blocks,
+        audit.entries.saturating_sub(audit.unique_blocks),
+        audit.min_height,
+        audit.max_height,
+        audit.v1_entries,
+        audit.v2_entries,
+        audit.unknown_entries,
+        audit.v1_unique_blocks,
+        audit.v2_unique_blocks,
+        audit.unknown_unique_blocks,
+    );
+}
+
+fn filter_audit_report_every(total: usize) -> usize {
+    std::cmp::max(10_000, total / 10).max(1)
 }
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
@@ -457,10 +544,29 @@ impl ScriptHashStatus {
         );
         let funding_blockhashes = index.limit_result(index.filter_by_funding(self.scripthash))?;
         let funding_candidates = funding_blockhashes.len();
+        let funding_candidate_audit = candidate_audit(index, funding_blockhashes.iter());
+        log_candidate_audit(diag.id, "funding", &funding_candidate_audit);
+        let funding_audit_enabled = funding_candidates >= FILTER_AUDIT_MIN_CANDIDATES;
         let funding_new_blocks = funding_blockhashes
             .iter()
             .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
             .count();
+        let funding_unique_new_blocks = funding_blockhashes
+            .iter()
+            .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
+            .copied()
+            .collect::<HashSet<_>>()
+            .len();
+        if funding_audit_enabled {
+            warn!(
+                "[blake2b-diag] filter fetch plan status_id={} kind=funding candidate_entries={} new_entries={} unique_new_blocks={} already_confirmed_entries={}",
+                diag.id,
+                funding_candidates,
+                funding_new_blocks,
+                funding_unique_new_blocks,
+                funding_candidates.saturating_sub(funding_new_blocks),
+            );
+        }
         diag.set_phase(
             "funding-block-fetch",
             format!(
@@ -470,7 +576,16 @@ impl ScriptHashStatus {
                 funding_candidates.saturating_sub(funding_new_blocks),
             ),
         );
+        let funding_report_every = filter_audit_report_every(funding_new_blocks);
+        let funding_verify_started = Instant::now();
         let mut funding_processed = 0usize;
+        let mut funding_matching_fetches = 0usize;
+        let mut funding_matching_txs = 0usize;
+        let mut funding_matching_outputs = 0usize;
+        let mut funding_v1_matching_fetches = 0usize;
+        let mut funding_v2_matching_fetches = 0usize;
+        let mut funding_unknown_matching_fetches = 0usize;
+        let mut funding_unique_matching_blocks = HashSet::<BlockHash>::new();
         self.for_new_blocks(funding_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
@@ -483,13 +598,26 @@ impl ScriptHashStatus {
                 ),
             );
             let filtered_outputs = filter_block_txs_outputs(block, self.scripthash);
+            let matching_txs = filtered_outputs.len();
+            let matching_outputs: usize = filtered_outputs.iter().map(|entry| entry.result.len()).sum();
+            if matching_txs != 0 {
+                funding_matching_fetches += 1;
+                funding_matching_txs += matching_txs;
+                funding_matching_outputs += matching_outputs;
+                funding_unique_matching_blocks.insert(blockhash);
+                match classify_candidate(index, &blockhash).1 {
+                    Some(true) => funding_v2_matching_fetches += 1,
+                    Some(false) => funding_v1_matching_fetches += 1,
+                    None => funding_unknown_matching_fetches += 1,
+                }
+            }
             diag.set_phase(
                 "funding-block-apply",
                 format!(
                     "processed={} total={} matching_txs={}",
                     funding_processed,
                     funding_new_blocks,
-                    filtered_outputs.len(),
+                    matching_txs,
                 ),
             );
             for filtered_outputs in filtered_outputs {
@@ -505,6 +633,32 @@ impl ScriptHashStatus {
                     .outputs = filtered_outputs.result;
             }
             funding_processed += 1;
+            if funding_audit_enabled
+                && funding_processed % funding_report_every == 0
+                && funding_processed < funding_new_blocks
+            {
+                let hit_rate_ppm = if funding_processed == 0 {
+                    0
+                } else {
+                    funding_matching_fetches.saturating_mul(1_000_000) / funding_processed
+                };
+                warn!(
+                    "[blake2b-diag] filter verify progress status_id={} kind=funding elapsed_ms={} processed={} total={} matching_fetches={} unique_matching_blocks={} nonmatching_fetches={} matching_txs={} matching_outputs={} hit_rate_ppm={} v1_matching_fetches={} v2_matching_fetches={} unknown_matching_fetches={}",
+                    diag.id,
+                    funding_verify_started.elapsed().as_millis(),
+                    funding_processed,
+                    funding_new_blocks,
+                    funding_matching_fetches,
+                    funding_unique_matching_blocks.len(),
+                    funding_processed.saturating_sub(funding_matching_fetches),
+                    funding_matching_txs,
+                    funding_matching_outputs,
+                    hit_rate_ppm,
+                    funding_v1_matching_fetches,
+                    funding_v2_matching_fetches,
+                    funding_unknown_matching_fetches,
+                );
+            }
             diag.set_phase(
                 "funding-block-fetch",
                 format!(
@@ -516,6 +670,29 @@ impl ScriptHashStatus {
                 ),
             );
         })?;
+        if funding_audit_enabled {
+            let hit_rate_ppm = if funding_processed == 0 {
+                0
+            } else {
+                funding_matching_fetches.saturating_mul(1_000_000) / funding_processed
+            };
+            warn!(
+                "[blake2b-diag] filter verify complete status_id={} kind=funding elapsed_ms={} processed={} unique_new_blocks={} matching_fetches={} unique_matching_blocks={} nonmatching_fetches={} matching_txs={} matching_outputs={} hit_rate_ppm={} v1_matching_fetches={} v2_matching_fetches={} unknown_matching_fetches={}",
+                diag.id,
+                funding_verify_started.elapsed().as_millis(),
+                funding_processed,
+                funding_unique_new_blocks,
+                funding_matching_fetches,
+                funding_unique_matching_blocks.len(),
+                funding_processed.saturating_sub(funding_matching_fetches),
+                funding_matching_txs,
+                funding_matching_outputs,
+                hit_rate_ppm,
+                funding_v1_matching_fetches,
+                funding_v2_matching_fetches,
+                funding_unknown_matching_fetches,
+            );
+        }
 
         diag.set_phase(
             "spending-index-lookup",
@@ -526,10 +703,23 @@ impl ScriptHashStatus {
             .flat_map_iter(|outpoint| index.filter_by_spending(*outpoint))
             .collect();
         let spending_candidates = spending_blockhashes.len();
+        let spending_candidate_audit = candidate_audit(index, spending_blockhashes.iter());
+        log_candidate_audit(diag.id, "spending", &spending_candidate_audit);
+        let spending_audit_enabled = spending_candidates >= FILTER_AUDIT_MIN_CANDIDATES;
         let spending_new_blocks = spending_blockhashes
             .iter()
             .filter(|blockhash| !self.confirmed.contains_key(*blockhash))
             .count();
+        if spending_audit_enabled {
+            warn!(
+                "[blake2b-diag] filter fetch plan status_id={} kind=spending outpoints={} unique_candidates={} new_blocks={} already_confirmed={}",
+                diag.id,
+                outpoints.len(),
+                spending_candidates,
+                spending_new_blocks,
+                spending_candidates.saturating_sub(spending_new_blocks),
+            );
+        }
         diag.set_phase(
             "spending-block-fetch",
             format!(
@@ -540,7 +730,16 @@ impl ScriptHashStatus {
                 spending_candidates.saturating_sub(spending_new_blocks),
             ),
         );
+        let spending_report_every = filter_audit_report_every(spending_new_blocks);
+        let spending_verify_started = Instant::now();
         let mut spending_processed = 0usize;
+        let mut spending_matching_fetches = 0usize;
+        let mut spending_matching_txs = 0usize;
+        let mut spending_matching_inputs = 0usize;
+        let mut spending_v1_matching_fetches = 0usize;
+        let mut spending_v2_matching_fetches = 0usize;
+        let mut spending_unknown_matching_fetches = 0usize;
+        let mut spending_unique_matching_blocks = HashSet::<BlockHash>::new();
         self.for_new_blocks(spending_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
@@ -553,13 +752,26 @@ impl ScriptHashStatus {
                 ),
             );
             let filtered_inputs = filter_block_txs_inputs(&block, outpoints);
+            let matching_txs = filtered_inputs.len();
+            let matching_inputs: usize = filtered_inputs.iter().map(|entry| entry.result.len()).sum();
+            if matching_txs != 0 {
+                spending_matching_fetches += 1;
+                spending_matching_txs += matching_txs;
+                spending_matching_inputs += matching_inputs;
+                spending_unique_matching_blocks.insert(blockhash);
+                match classify_candidate(index, &blockhash).1 {
+                    Some(true) => spending_v2_matching_fetches += 1,
+                    Some(false) => spending_v1_matching_fetches += 1,
+                    None => spending_unknown_matching_fetches += 1,
+                }
+            }
             diag.set_phase(
                 "spending-block-apply",
                 format!(
                     "processed={} total={} matching_txs={}",
                     spending_processed,
                     spending_new_blocks,
-                    filtered_inputs.len(),
+                    matching_txs,
                 ),
             );
             for filtered_inputs in filtered_inputs {
@@ -570,6 +782,32 @@ impl ScriptHashStatus {
                     .spent = filtered_inputs.result;
             }
             spending_processed += 1;
+            if spending_audit_enabled
+                && spending_processed % spending_report_every == 0
+                && spending_processed < spending_new_blocks
+            {
+                let hit_rate_ppm = if spending_processed == 0 {
+                    0
+                } else {
+                    spending_matching_fetches.saturating_mul(1_000_000) / spending_processed
+                };
+                warn!(
+                    "[blake2b-diag] filter verify progress status_id={} kind=spending elapsed_ms={} processed={} total={} matching_fetches={} unique_matching_blocks={} nonmatching_fetches={} matching_txs={} matching_inputs={} hit_rate_ppm={} v1_matching_fetches={} v2_matching_fetches={} unknown_matching_fetches={}",
+                    diag.id,
+                    spending_verify_started.elapsed().as_millis(),
+                    spending_processed,
+                    spending_new_blocks,
+                    spending_matching_fetches,
+                    spending_unique_matching_blocks.len(),
+                    spending_processed.saturating_sub(spending_matching_fetches),
+                    spending_matching_txs,
+                    spending_matching_inputs,
+                    hit_rate_ppm,
+                    spending_v1_matching_fetches,
+                    spending_v2_matching_fetches,
+                    spending_unknown_matching_fetches,
+                );
+            }
             diag.set_phase(
                 "spending-block-fetch",
                 format!(
@@ -582,6 +820,28 @@ impl ScriptHashStatus {
                 ),
             );
         })?;
+        if spending_audit_enabled {
+            let hit_rate_ppm = if spending_processed == 0 {
+                0
+            } else {
+                spending_matching_fetches.saturating_mul(1_000_000) / spending_processed
+            };
+            warn!(
+                "[blake2b-diag] filter verify complete status_id={} kind=spending elapsed_ms={} processed={} matching_fetches={} unique_matching_blocks={} nonmatching_fetches={} matching_txs={} matching_inputs={} hit_rate_ppm={} v1_matching_fetches={} v2_matching_fetches={} unknown_matching_fetches={}",
+                diag.id,
+                spending_verify_started.elapsed().as_millis(),
+                spending_processed,
+                spending_matching_fetches,
+                spending_unique_matching_blocks.len(),
+                spending_processed.saturating_sub(spending_matching_fetches),
+                spending_matching_txs,
+                spending_matching_inputs,
+                hit_rate_ppm,
+                spending_v1_matching_fetches,
+                spending_v2_matching_fetches,
+                spending_unknown_matching_fetches,
+            );
+        }
 
         diag.set_phase(
             "confirmed-finalize",
