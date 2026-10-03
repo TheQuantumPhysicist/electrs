@@ -698,6 +698,12 @@ impl Rpc {
         lines
             .iter()
             .map(|line| {
+                if line.contains("\"blockchain.scripthash.subscribe\"") {
+                    warn!(
+                        "THISISPRIVATE [blake2b-diag] raw Electrum subscribe request line={}",
+                        line
+                    );
+                }
                 parse_requests(line)
                     .map(Calls::parse)
                     .map_err(error_msg_no_id)
